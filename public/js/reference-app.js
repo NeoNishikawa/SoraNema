@@ -2019,7 +2019,7 @@ const FILTER_OPTIONS = { mainType: [["","Tipe"],["Serial TV","Serial TV"],["Live
    build berikutnya harus ikut mengarahkan publish-nya, atau pemeriksaan
    update akan mengarahkan pengguna ke rilis yang salah. */
 const DOWNLOAD_LINKS = {
-  exe: "https://github.com/NeoNishikawa/soranema-model/releases/download/exe/SoraNema-Setup-x64.exe",
+  exe: "https://github.com",
   /* Nama berkas sengaja tidak membawa nomor versi. Tag "apk" dan nama
      berkas tetap, jadi tautan tidak mati setiap rilis baru; yang berubah
      adalah nama berkas setelahnya. Itu yang dibutuhkan pemeriksaan
@@ -2028,7 +2028,7 @@ const DOWNLOAD_LINKS = {
 
      Kalau nanti .-url ini diganti ke tempat lain, build berikutnya harus
      ikut mengarahkan publish-nya, persis seperti catatan .exe di atas. */
-  apk: "https://github.com/NeoNishikawa/soranema-model/releases/download/apk/SoraNema-release.apk",
+  apk: "#",
 };
 
 /* EXE punya aplikasinya sendiri; APK memblokir navigasi ke luar lewat NavGuard
