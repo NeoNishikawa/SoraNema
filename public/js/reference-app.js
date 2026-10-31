@@ -2019,7 +2019,7 @@ const FILTER_OPTIONS = { mainType: [["","Tipe"],["Serial TV","Serial TV"],["Live
    build berikutnya harus ikut mengarahkan publish-nya, atau pemeriksaan
    update akan mengarahkan pengguna ke rilis yang salah. */
 const DOWNLOAD_LINKS = {
-  exe: "https://github.com",
+  exe: "https://github.com/NeoNishikawa/SoraNema-app/releases/download/exe/SoraNema_0.1.0_x64-setup.exe",
   /* Nama berkas sengaja tidak membawa nomor versi. Tag "apk" dan nama
      berkas tetap, jadi tautan tidak mati setiap rilis baru; yang berubah
      adalah nama berkas setelahnya. Itu yang dibutuhkan pemeriksaan
