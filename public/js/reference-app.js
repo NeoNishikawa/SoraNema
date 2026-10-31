@@ -2028,7 +2028,7 @@ const DOWNLOAD_LINKS = {
 
      Kalau nanti .-url ini diganti ke tempat lain, build berikutnya harus
      ikut mengarahkan publish-nya, persis seperti catatan .exe di atas. */
-  apk: "#",
+  apk: "nothing",
 };
 
 /* EXE punya aplikasinya sendiri; APK memblokir navigasi ke luar lewat NavGuard
