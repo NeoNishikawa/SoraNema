@@ -1,0 +1,100 @@
+{
+  "name": "soranema-personal",
+  "version": "3.0.0",
+  "private": true,
+  "description": "SoraNema V3 - personal anime tracker with an Animasu proxy.",
+  "homepage": "https://github.com/soranema/soranema-personal",
+  "author": {
+    "name": "SoraNema",
+    "email": "maintainer@soranema.local"
+  },
+  "main": "desktop/main.js",
+  "engines": {
+    "node": ">=24.22.1 <27"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "desktop:start": "electron .",
+    "desktop:dist": "electron-builder",
+    "desktop:win": "electron-builder --win nsis portable --publish never",
+    "dev": "node scripts/dev-watch.js",
+    "test": "node --test test/*.test.js",
+    "test:browser": "node scripts/press-limit-browser-test.js",
+    "test:motion": "node scripts/motion-browser-test.js",
+    "test:download": "node scripts/download-drive-browser-test.js",
+    "test:laporan": "node scripts/laporan-dua-pengguna-browser-test.js",
+    "test:edge": "php edge/tests/run.php && php edge/tests/smoke.php",
+    "test:seal-edge": "node scripts/seal-edge-browser-test.js",
+    "test:browser:all": "node scripts/browser-tests-all.js",
+    "test:integration": "node scripts/zip-route-integration.js",
+    "test:keys": "node scripts/search-key-audit.js",
+    "fuzz:api": "node scripts/fuzz-api-stress.js",
+    "test:load": "node scripts/load-bench.js",
+    "seal": "node scripts/seal.js",
+    "seal:check": "node scripts/seal.js --check",
+    "test:all": "npm test && npm run seal:check && npm run test:keys && npm run test:integration && npm run fuzz:api"
+  },
+  "devDependencies": {
+    "@fontsource/dela-gothic-one": "^5.3.0",
+    "@fontsource/potta-one": "^5.3.0",
+    "@fontsource/roboto-condensed": "^5.3.0",
+    "electron": "^36.3.2",
+    "electron-builder": "^26.0.12",
+    "ttf2woff2": "^8.0.1"
+  },
+  "overrides": {
+    "proxy-addr": "^2.0.8"
+  },
+  "dependencies": {
+    "animejs": "^4.5.0",
+    "axios": "^1.7.9",
+    "cheerio": "^1.0.0",
+    "compression": "^1.8.2",
+    "cors": "^2.8.5",
+    "express": "^4.22.3",
+    "three": "^0.185.1",
+    "yaoi": "^1.0.7"
+  },
+  "build": {
+    "appId": "com.soranema.personal",
+    "productName": "SoraNema V3",
+    "directories": {
+      "output": "release"
+    },
+    "asar": true,
+    "files": [
+      "desktop/**/*",
+      "public/**/*",
+      "server.js",
+      "settings.js",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "AudioVideo"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "artifactName": "SoraNema-${version}-Setup-${arch}.${ext}",
+      "displayLanguageSelector": false
+    },
+    "portable": {
+      "artifactName": "SoraNema-${version}-Portable-${arch}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ]
+    }
+  }
+}

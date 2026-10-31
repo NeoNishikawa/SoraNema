@@ -1,0 +1,65 @@
+/* SoraNema — readable text overrides
+   Teks informatif dibuat sedikit lebih besar untuk pengguna dengan rabun.
+   Badge angka, placeholder gambar, dan teks dekoratif tidak dinaikkan agar
+   hierarki visual serta ukuran kartu tetap stabil. */
+
+/* Sidebar, navigasi, dan menu */
+.sb-user-sub{font-size:12px}
+.sb-label{font-size:11px}
+.nav-badge{font-size:11px}
+.dl-t strong{font-size:13.5px}
+.dl-t small,.dl-note{font-size:12px}
+.dl-note code{font-size:11px}
+.app.collapsed .nav-item::after,.app.collapsed .sb-bottom button::after{font-size:13px}
+
+/* Filter, menu, profil, dan tombol */
+.gf-title{font-size:12px}
+.gf-mini-btn{font-size:12.5px}
+.gf-chip,.gf-storage .gf-chip{font-size:12.5px}
+.gf-empty{font-size:13px}
+.gf-warn{font-size:12px}
+.data-menu button{font-size:13px}
+.pp-label{font-size:11px}
+.pp-xp-text{font-size:11.5px}
+.pp-stat span{font-size:10.5px}
+.btn-sm{font-size:12.5px}
+.hold-btn .hold-hint{font-size:11px}
+
+/* Katalog, koleksi, dan metadata episode */
+.card-meta{font-size:12px}
+.progress-top{font-size:11.5px}
+.card-actions .btn{font-size:12px}
+.eps-badge{font-size:10.5px}
+.tab .count{font-size:11.5px}
+
+/* Detail, mirror, player, toast, dan dialog */
+.modal-bar .title{font-size:13.5px}
+.watch-sub{font-size:13.5px}
+.detail-block h4,.panel-title{font-size:12px}
+.detail-item .k{font-size:11px}
+.chip{font-size:11.5px}
+.mirror-options .mirror-tampil-mati{font-size:12.5px}
+.mirror-box .note{font-size:12px}
+.toast .t-msg{font-size:13px}
+.confirm-modal ul{font-size:13.5px}
+.pip-window .pip-title{font-size:12.5px}
+
+/* Continue watching dan rekomendasi */
+.cw-ep{font-size:12.5px}
+.cw-empty span{font-size:13px}
+.rec-rail .card-title{font-size:13px}
+.rec-rail .card-meta{font-size:11.5px}
+
+/* Pengingat screen-time dan maintenance banner */
+.screen-time-eyebrow{font-size:12px}
+.screen-time-countdown,.screen-time-btn{font-size:13px}
+.notice-banner .nb-title{font-size:13.5px}
+.notice-banner .nb-text{font-size:13px}
+.notice-banner .nb-next{font-size:12px}
+
+/* Jangan membiarkan teks yang diperbesar keluar dari kontrol sempit. */
+@media (max-width:640px){
+  .dl-t small,.dl-note{line-height:1.6}
+  .card-actions .btn{font-size:11.5px}
+  .rec-rail .card-meta{font-size:11px}
+}

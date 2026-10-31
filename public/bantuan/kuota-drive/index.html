@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="id" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="description" content="Panduan singkat saat Google Drive menampilkan kuota unduhan di SoraNema V3: pilih mirror lain, coba lagi nanti, dan pahami batas yang datang dari Google.">
+<meta name="theme-color" content="#0D0D0D">
+<title>Kuota Google Drive — Bantuan SoraNema V3</title>
+<link rel="icon" href="/assets/logo.png" type="image/png">
+<link rel="stylesheet" href="/css/tokens.css?v=2.3.9">
+<link rel="stylesheet" href="/bantuan/bantuan.css?v=1.1.0">
+</head>
+<body>
+<div class="page">
+
+  <header class="top">
+    <a class="brand" href="/" aria-label="SoraNema V3, kembali ke beranda">Sora<span>Nema</span> V3</a>
+    <a class="back" href="/">Kembali ke beranda</a>
+  </header>
+
+  <main class="wrap">
+    <article class="card" aria-labelledby="judul">
+      <p class="eyebrow"><span class="dot" aria-hidden="true"></span>Bantuan unduhan</p>
+      <div class="badges">
+        <span class="badge">Google Drive</span>
+        <span class="badge badge-muted">Kuota sementara</span>
+      </div>
+
+      <h1 id="judul">Kuota Drive sedang penuh</h1>
+      <p class="lead">Google membatasi unduhan file ini untuk sementara. Ini bukan batas dari SoraNema, dan file-nya tidak hilang. Kuota biasanya pulih sendiri, kadang sampai 24 jam.</p>
+
+      <div class="callout" role="note">
+        <strong>Jangan klik berulang.</strong>
+        Klik terus-menerus tidak mempercepat kuota. Pilih mirror lain dulu, lalu kembali ke Drive nanti.
+      </div>
+
+      <section class="steps" id="langkah" aria-labelledby="langkah-judul">
+        <h2 id="langkah-judul">Tiga langkah yang paling cepat</h2>
+        <ol>
+          <li class="step">
+            <span class="num" aria-hidden="true">1</span>
+            <div>
+              <strong>Kembali ke halaman detail.</strong>
+              <p>Buka batch yang sama, lalu pilih resolusi lain dari dropdown. Jangan tutup halaman detail kalau belum mencoba mirror lain.</p>
+            </div>
+          </li>
+          <li class="step">
+            <span class="num" aria-hidden="true">2</span>
+            <div>
+              <strong>Pakai mirror selain Google Drive.</strong>
+              <p>Pixeldrain, MediaFire, atau Mega. Ketiganya membuka tab baru; itu normal karena hostnya tidak mengizinkan unduhan same-tab.</p>
+            </div>
+          </li>
+          <li class="step">
+            <span class="num" aria-hidden="true">3</span>
+            <div>
+              <strong>Coba Drive lagi nanti.</strong>
+              <p>Beri jeda beberapa jam atau coba besok. File yang sama bisa tersedia lagi tanpa perlu diunggah ulang.</p>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <div class="actions">
+        <a class="btn btn-primary" href="/">Kembali ke SoraNema</a>
+        <a class="btn btn-ghost" href="#faq">Baca pertanyaan umum</a>
+      </div>
+    </article>
+
+    <section class="faq" id="faq" aria-labelledby="faq-judul">
+      <h2 id="faq-judul">Pertanyaan umum</h2>
+
+      <details>
+        <summary>Apakah file saya hilang?</summary>
+        <p>Tidak. File tetap ada di Google Drive. Yang dibatasi adalah jumlah orang yang boleh mengunduhnya dalam waktu tertentu. Ini pengaman Google, bukan file yang dihapus.</p>
+      </details>
+
+      <details>
+        <summary>Kenapa hanya Drive yang diunduh di tab yang sama?</summary>
+        <p>Drive mengirim file sebagai lampiran, jadi browser bisa mengunduhnya tanpa berpindah halaman. Pixeldrain menolak unduhan lintas situs dengan 403, Mega memakai enkripsi, dan MediaFire membuka halamannya sendiri — karena itu ketiganya menjadi link-out ke tab baru. <a href="/bantuan/pixeldrain/">Kenapa Pixeldrain menolak unduhan langsung?</a></p>
+      </details>
+
+      <details>
+        <summary>Apakah SoraNema membatasi ukuran file?</summary>
+        <p>Tidak. Satu klik ke tombol Drive hanya satu permintaan; byte file mengalir langsung dari host ke browser, bukan lewat server SoraNema. Batas burst di server hanya mencegah spam klik, bukan membatasi ukuran file.</p>
+      </details>
+
+      <details>
+        <summary>Sudah lama, tapi masih kuota. Harus bagaimana?</summary>
+        <p>Pilih mirror lain atau batch lain di halaman detail. Kalau semua mirror mati, kemungkinan tautannya sudah kedaluwarsa dan perlu diunggah ulang oleh pemilik file.</p>
+      </details>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>SoraNema V3 · Panduan unduhan</span>
+    <a href="/">Beranda</a>
+  </footer>
+
+</div>
+</body>
+</html>

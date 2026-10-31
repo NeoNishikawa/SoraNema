@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="id" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="description" content="Panduan saat Pixeldrain menampilkan 403 hotlink_detected di SoraNema V3: buka halaman file, klik Download di sana, atau pilih mirror lain. Tanpa proxy dan tanpa batas ukuran dari SoraNema.">
+<meta name="theme-color" content="#0D0D0D">
+<title>Pixeldrain 403 — Bantuan SoraNema V3</title>
+<link rel="icon" href="/assets/logo.png" type="image/png">
+<link rel="stylesheet" href="/css/tokens.css?v=2.3.9">
+<link rel="stylesheet" href="/bantuan/bantuan.css?v=1.1.0">
+</head>
+<body>
+<div class="page">
+
+  <header class="top">
+    <a class="brand" href="/" aria-label="SoraNema V3, kembali ke beranda">Sora<span>Nema</span> V3</a>
+    <a class="back" href="/">Kembali ke beranda</a>
+  </header>
+
+  <main class="wrap">
+    <article class="card" aria-labelledby="judul">
+      <p class="eyebrow"><span class="dot" aria-hidden="true"></span>Bantuan unduhan</p>
+      <div class="badges">
+        <span class="badge">Pixeldrain</span>
+        <span class="badge badge-muted">403 hotlink</span>
+      </div>
+
+      <h1 id="judul">Pixeldrain menolak unduhan langsung</h1>
+      <p class="lead">Pixeldrain memblokir unduhan yang datang dari situs lain. Itu pengaman milik Pixeldrain, bukan tautan yang rusak dan bukan batas dari SoraNema. Unduhan tetap bisa dilakukan lewat halaman file Pixeldrain.</p>
+
+      <div class="callout" role="note">
+        <strong>Buka halaman filenya dulu.</strong>
+        Buka <code>pixeldrain.com/u/…</code> di tab itu, lalu klik tombol Download di halaman Pixeldrain. Permintaan dari halaman mereka sendiri tidak dianggap hotlink.
+      </div>
+
+      <section class="steps" id="langkah" aria-labelledby="langkah-judul">
+        <h2 id="langkah-judul">Tiga langkah yang paling cepat</h2>
+        <ol>
+          <li class="step">
+            <span class="num" aria-hidden="true">1</span>
+            <div>
+              <strong>Buka tautan Pixeldrain dari halaman detail.</strong>
+              <p>Tautan ini memang membuka tab baru. Itu disengaja: kalau dipaksa di tab yang sama, Pixeldrain membalas JSON <code>403 hotlink_detected</code>, bukan file.</p>
+            </div>
+          </li>
+          <li class="step">
+            <span class="num" aria-hidden="true">2</span>
+            <div>
+              <strong>Klik Download di halaman Pixeldrain.</strong>
+              <p>Gunakan tombol unduh milik Pixeldrain, bukan URL file langsung. Dari halaman mereka sendiri, permintaan unduhan dianggap sah.</p>
+            </div>
+          </li>
+          <li class="step">
+            <span class="num" aria-hidden="true">3</span>
+            <div>
+              <strong>Kalau masih ditolak, pilih mirror lain.</strong>
+              <p>Google Drive bisa diunduh di tab yang sama. MediaFire dan Mega juga tersedia sebagai link-out. Coba mirror lain sebelum menyimpulkan tautannya mati.</p>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <div class="actions">
+        <a class="btn btn-primary" href="/">Kembali ke SoraNema</a>
+        <a class="btn btn-ghost" href="#faq">Baca pertanyaan umum</a>
+      </div>
+    </article>
+
+    <section class="faq" id="faq" aria-labelledby="faq-judul">
+      <h2 id="faq-judul">Pertanyaan umum</h2>
+
+      <details>
+        <summary>Apa arti 403 hotlink_detected?</summary>
+        <p>Pixeldrain menganggap permintaan itu datang dari situs lain, bukan dari halaman filenya. Responsnya berupa JSON error, bukan file. Ini pengaman anti-hotlink mereka, bukan tanda file sudah dihapus.</p>
+      </details>
+
+      <details>
+        <summary>Kenapa SoraNema tidak memakai proxy saja?</summary>
+        <p>File anime sering berukuran 1–4 GB. Proxy berarti seluruh byte lewat server SoraNema: bandwidth, penyimpanan sementara, dan biaya server naik, sementara aplikasi ini dijalankan tanpa anggaran. Karena itu Pixeldrain tetap diarahkan ke halaman aslinya.</p>
+      </details>
+
+      <details>
+        <summary>Kenapa Google Drive bisa di tab yang sama, Pixeldrain tidak?</summary>
+        <p>Drive mengirim file sebagai lampiran, jadi browser bisa mengunduhnya tanpa berpindah halaman. Pixeldrain memeriksa asal permintaan dan menolak unduhan lintas situs dengan 403. Karena itu hanya Drive yang punya resolver same-tab.</p>
+      </details>
+
+      <details>
+        <summary>Apakah tautan saya rusak?</summary>
+        <p>Belum tentu. Kalau halaman <code>pixeldrain.com/u/…</code> terbuka dan menampilkan file, tautannya masih hidup. Kalau halaman itu sendiri 404 atau file sudah dihapus, barulah tautan perlu diganti oleh pengunggah.</p>
+      </details>
+
+      <details>
+        <summary>Apakah saya perlu akun Pixeldrain?</summary>
+        <p>Tidak untuk file publik. Pixeldrain mungkin membatasi kecepatan untuk pengguna gratis; itu kebijakan mereka, bukan batas dari SoraNema. Kalau unduhan terasa lambat, coba mirror lain.</p>
+      </details>
+
+      <details>
+        <summary>Apakah SoraNema membatasi ukuran file?</summary>
+        <p>Tidak. Untuk Drive, server hanya mengirim satu redirect dan byte file mengalir langsung dari Google ke browser. Untuk Pixeldrain, SoraNema hanya menyediakan tautan; file tidak pernah melewati server SoraNema.</p>
+      </details>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>SoraNema V3 · Panduan unduhan</span>
+    <a href="/">Beranda</a>
+  </footer>
+
+</div>
+</body>
+</html>

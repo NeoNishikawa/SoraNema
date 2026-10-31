@@ -1,0 +1,3700 @@
+const express = require("express");
+const compression = require("compression");
+const axios = require("axios");
+const cheerio = require("cheerio");
+const crypto = require("node:crypto");
+const path = require("path");
+const fs = require("fs");
+const { createGracefulShutdown } = require("./shutdown");
+const { ANIMASU_BASE_URL, SAMEHADAKU_BASE_URL, HIANIME_BASE_URL, HIANIME_MODE, HIANIME_API_BASE_URL, HIANIME_SITE_URL, SUPPLEMENT_BELOW_EPISODES, PORT, REQUEST_TIMEOUT_MS, SEARCH_BUDGET_MS, DAILY_CACHE_MS, DETAIL_CACHE_MS, STREAM_CACHE_MS, MAX_UPSTREAM_CONCURRENCY, SEARCH_UPSTREAM_CONCURRENCY, UPSTREAM_MIN_INTERVAL_MS, SEARCH_UPSTREAM_MIN_INTERVAL_MS, SEARCH_RETRY_COUNT, SEARCH_RETRY_BACKOFF_MS, SOURCE_BLOCK_COOLDOWN_MS, MAINTENANCE, HEALTH_DETAIL, TRUST_PROXY, SEARCH_RATE_BURST, SEARCH_RATE_REFILL_MS, DETAIL_RATE_BURST, DETAIL_RATE_REFILL_MS, STREAM_RATE_BURST, STREAM_RATE_REFILL_MS, CONTENT_RATE_BURST, CONTENT_RATE_REFILL_MS, RATE_LIMIT_MAX_KEYS, UPSTREAM_QUEUE_LIMIT, UPSTREAM_QUEUE_RETRY_MS } = require("./settings");
+
+process.env.ANIMASU_BASE_URL = ANIMASU_BASE_URL;
+const { animasu } = require("yaoi");
+axios.defaults.timeout = REQUEST_TIMEOUT_MS;
+
+const app = express();
+/* CSS/JS/HTML/JSON dikirim gzip. Tanpa ini "reference-app.js" 163 KB dan
+   components.css 57 KB berangkat apa adanya. Ambang 1 KB supaya balasan
+   kecil (health, error) tidak membayar biaya kompresi. */
+app.use(compression({ threshold: 1024 }));
+/* Penanda proses ini. /api/health membawanya supaya tab yang sudah terlanjur
+   terbuka bisa tahu server sudah di-restart (npm run dev) dan bundle di tab
+   itu mungkin tidak lagi cocok dengan endpoint yang sekarang melayani. */
+const BOOT_ID = crypto.randomBytes(6).toString("hex");
+const memory = new Map();
+const pending = new Map();
+const staleKeys = new Set();
+const CACHE_MS = 75_000;
+/* Rekomendasi memakai data AniList yang jarang berubah. Cache 30 menit
+   membuat membuka beranda berkali-kali tidak menembak AniList/Animasu lagi. */
+const REC_CACHE_MS = Number(process.env.REC_CACHE_MS) > 0 ? Number(process.env.REC_CACHE_MS) : 30 * 60 * 1000;
+const REC_LIMIT = 10;
+const ANILIST_ENDPOINT = process.env.ANILIST_ENDPOINT || "https://graphql.anilist.co";
+const ANILIST_TIMEOUT_MS = Number(process.env.ANILIST_TIMEOUT_MS) > 0 ? Number(process.env.ANILIST_TIMEOUT_MS) : 4500;
+const ANILIST_ACCEPT_STATUS = (status) => status < 500;
+let anilistCooldownUntil = 0;
+let anilistRateLimited = false;
+/* Metadata per judul disimpan terpisah dari cache rekomendasi. Genre dan
+   populer sering memuat judul yang sama (mis. anime ongoing), jadi tanpa
+   cache ini judul yang sama ditembak dua kali dalam satu menit. */
+const cachePositif = Number(process.env.ANILIST_TITLE_CACHE_MS);
+const cacheNegatif = Number(process.env.ANILIST_TITLE_MISS_MS);
+const ANILIST_TITLE_CACHE_MS = cachePositif >= 0 ? cachePositif : 24 * 60 * 60 * 1000;
+const ANILIST_TITLE_MISS_MS = cacheNegatif >= 0 ? cacheNegatif : 2 * 60 * 60 * 1000;
+const anilistTitleCache = new Map();
+function anilistCacheGet(query) {
+  const key = normalizeSearchText(query);
+  const entry = anilistTitleCache.get(key);
+  if (!entry) return { hit: false, value: null };
+  const ttl = entry.value ? ANILIST_TITLE_CACHE_MS : ANILIST_TITLE_MISS_MS;
+  if (Date.now() - entry.at > ttl) { anilistTitleCache.delete(key); return { hit: false, value: null }; }
+  return { hit: true, value: entry.value };
+}
+function anilistCacheSet(query, value) {
+  const key = normalizeSearchText(query);
+  if (!key) return;
+  anilistTitleCache.set(key, { at: Date.now(), value: value || null });
+  capMap(anilistTitleCache);
+}
+const upstreamQueue = [];
+let upstreamActive = 0;
+/* Batas concurrency dihitung PER HOST, bukan per lane. Sebelumnya satu slot
+   untuk seluruh lane membuat permintaan ke Animasu, Samehadaku, dan HiAnime
+   saling mengantre: HiAnime butuh tiga request berurutan (halaman anime,
+   halaman episode, buka wrapper embed), jadi ia selalu kalah balapan dengan
+   timeout 9 detik dan mirornya hilang. Tiap host tetap dibatasi
+   MAX_UPSTREAM_CONCURRENCY dan dijeda 1,5 detik per host, tetapi host yang
+   berbeda boleh berjalan bersamaan. */
+const upstreamActiveByLaneOrigin = new Map();
+const upstreamLastStarted = new Map();
+const upstreamLastStartedByLane = new Map();
+const upstreamCooldownUntil = new Map();
+let upstreamDrainTimer = null;
+const MAX_CACHE_ENTRIES = Number(process.env.MAX_CACHE_ENTRIES) > 0 ? Number(process.env.MAX_CACHE_ENTRIES) : 64;
+/* "Tidak ditemukan" adalah jawaban yang valid, bukan kegagalan. Tanpa ini,
+   mengetik ulang query yang memang kosong menembak upstream lagi setiap kali
+   dan memotong kuota untuk hasil yang sudah pasti sama. TTL-nya pendek
+   supaya anime baru tetap muncul cepat. */
+const EMPTY_CACHE_MS = 20_000;
+/* Unduhan diambil lewat endpoint terpisah, bukan saat halaman detail dibuka.
+   Satu judul Samehadaku bisa berarti lima request berurutan (cari, halaman
+   anime, lalu sampai tiga halaman batch); menahannya di route detail membuat
+   halaman terasa mati. Endpoint unduhan menunggu Samehadaku paling lama
+   DOWNLOAD_WAIT_MS. Batch Animasu sudah ada di detail yang di-cache, jadi
+   dikirim lebih dulu kalau Samehadaku belum selesai. */
+const DOWNLOAD_WAIT_MS = Number(process.env.DOWNLOAD_WAIT_MS) > 0 ? Number(process.env.DOWNLOAD_WAIT_MS) : 9000;
+/* Hasil gabungan di-cache sebentar supaya klik berulang atau beberapa tab
+   tidak menembak upstream lagi, tetapi kegagalan cepat dicoba ulang. */
+const DOWNLOAD_RESULT_TTL_MS = 60_000;
+const SLIDE_SIZE = 20;
+const MAX_SEARCH_PAGES = Number(process.env.MAX_SEARCH_PAGES) > 0 ? Number(process.env.MAX_SEARCH_PAGES) : 20;
+const MIN_SEARCH_LENGTH = 2;
+const USER_TIME_ZONE = "Asia/Bangkok";
+const DAY_KEYS = ["minggu", "senin", "selasa", "rabu", "kamis", "jumat", "sabtu"];
+const TITLE_ALIASES_PATH = path.join(__dirname, "public", "data", "title-aliases.json");
+const BUILTIN_TITLE_ALIASES = { "that time i got reincarnated as a slime": ["Tensei shitara Slime Datta Ken"] };
+const ALIAS_MAX_CANDIDATES = 6;
+const FALLBACK_DAILY_PATH = path.join(__dirname, "public", "data", "last-known-daily.json");
+
+function storeCache(key, data) {
+  memory.delete(key);
+  memory.set(key, { data, timestamp: Date.now() });
+  while (memory.size > MAX_CACHE_ENTRIES) memory.delete(memory.keys().next().value);
+}
+
+function isEmptyData(data) {
+  return data === undefined || data === null || (Array.isArray(data) && data.length === 0) || (Array.isArray(data?.data) && data.data.length === 0);
+}
+
+function cached(key, task, ttl = CACHE_MS, staleOnError = false) {
+  const previous = memory.get(key);
+  const freshTtl = previous && isEmptyData(previous.data) ? Math.min(ttl, EMPTY_CACHE_MS) : ttl;
+  if (previous && Date.now() - previous.timestamp < freshTtl) {
+    staleKeys.delete(key);
+    return Promise.resolve(previous.data);
+  }
+  if (pending.has(key)) return pending.get(key);
+  const promise = Promise.resolve().then(task).then((data) => {
+    storeCache(key, data);
+    staleKeys.delete(key);
+    if (!isEmptyData(data)) return data;
+    if (staleOnError && previous) {
+      staleKeys.add(key);
+      return previous.data;
+    }
+    return data;
+  }).catch((error) => {
+    if (staleOnError && previous) {
+      staleKeys.add(key);
+      return previous.data;
+    }
+    throw error;
+  }).finally(() => pending.delete(key));
+  pending.set(key, promise);
+  return promise;
+}
+
+function isStale(key) { return staleKeys.has(key); }
+
+function readFallbackDaily() {
+  try {
+    const fallback = JSON.parse(fs.readFileSync(FALLBACK_DAILY_PATH, "utf8"));
+    const data = Array.isArray(fallback.data) ? fallback.data : [];
+    return { ...fallback, data, slides: slices(data), total: data.length, slideSize: SLIDE_SIZE, provider: "fallback", stale: true };
+  } catch (_) { return null; }
+}
+
+function fallbackDetailFromDaily(slug) {
+  const item = readFallbackDaily()?.data?.find((anime) => anime.slug === String(slug || ""));
+  if (!item) return null;
+  return {
+    ...item,
+    synonym: "",
+    synopsis: "Detail live sedang tidak tersedia; metadata dasar ini berasal dari snapshot jadwal terakhir.",
+    rating: 0,
+    genres: [],
+    status: item.status || "UNKNOWN",
+    aired: "Unknown",
+    duration: "Unknown",
+    studio: "Unknown",
+    season: "Unknown",
+    trailer: "",
+    updateAt: "",
+    episodes: [],
+    batches: [],
+    source: "local-snapshot",
+  };
+}
+
+/* Temuan Fuzz Putaran 2 (8 Oktober): parser tidak null-safe/type-safe —
+   45 throw jika struktur upstream berubah, walau jalur HTTP hari ini masih
+   aman. Dibereskan di sini, bukan di tujuan: kebijakannya "parser menerima
+   TIDAK APA PUN dan menjawab nilai kosong yang sah", bukan memaksa semua
+   pemanggil. Objek tanpa primitive ({toString:null}) melempar dari String(),
+   jadi primitif diteruskan, dan sisanya diganti string kosong. */
+function teksAman(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+/* cheerio melempar "Cannot create property 'prev'" kalau diberi input
+   bukan-string yang truthy (angka, objek, Buffer). Semua parser membaca
+   dari sumber upstream; satu payload baru saja tidak boleh membuat 500. */
+function htmlAman(html) {
+  return typeof html === "string" ? html : "";
+}
+
+function normalizeSearchText(value) {
+  return teksAman(value).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+}
+
+/* Map bantu dibatasi agar query unik jangka panjang tidak menumbuhkan
+   memori tanpa batas (temuan fuzz 6 Oktober 2026). Map mempertahankan
+   urutan sisip, jadi cukup buang kunci tertua (FIFO) begitu lewat limit. */
+const AUX_MAP_LIMIT = 256;
+function capMap(map) { while (map.size > AUX_MAP_LIMIT) map.delete(map.keys().next().value); }
+const aliasMemory = new Map();
+const aliasPending = new Map();
+async function fetchEnglishAliases(search) {
+  const normalized = normalizeSearchText(search);
+  if (normalized.length < 3) return [];
+  const aliases = (BUILTIN_TITLE_ALIASES[normalized] || []).filter((item) => normalizeSearchText(item) !== normalized).slice(0, ALIAS_MAX_CANDIDATES);
+  aliasMemory.set(normalized, { data: aliases, timestamp: Date.now() });
+  capMap(aliasMemory);
+  return aliases;
+}
+
+function splitAliases(value) {
+  if (Array.isArray(value)) return value.flatMap((item) => splitAliases(item));
+  return teksAman(value).split(/[|;\n,]+/).map((item) => item.replace(/^(synonym|alternative|english title|judul inggris)\s*[:：-]\s*/i, "").trim()).filter(Boolean);
+}
+
+let titleAliasIndex;
+let titleAliasBySlug;
+let titleAliasByTitle;
+function readTitleAliases() {
+  if (titleAliasIndex) return titleAliasIndex;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(TITLE_ALIASES_PATH, "utf8"));
+    titleAliasIndex = Array.isArray(parsed.data) ? parsed.data : [];
+  } catch (_) { titleAliasIndex = []; }
+  titleAliasBySlug = new Map(titleAliasIndex.filter((record) => record.slug).map((record) => [record.slug, record]));
+  titleAliasByTitle = new Map(titleAliasIndex.filter((record) => record.title).map((record) => [normalizeSearchText(record.title), record]));
+  return titleAliasIndex;
+}
+
+function findTitleAlias(item) {
+  readTitleAliases();
+  const itemSlug = String(item.slug || "");
+  const normalizedTitle = normalizeSearchText(item.title);
+  return titleAliasBySlug.get(itemSlug) || [...titleAliasBySlug.entries()].find(([slug]) => itemSlug.startsWith(`${slug}-`))?.[1] || titleAliasByTitle.get(normalizedTitle) || [...titleAliasByTitle.entries()].find(([title]) => normalizedTitle.startsWith(`${title} `))?.[1] || titleAliasIndex.find((record) => record.aliases?.some((alias) => normalizeSearchText(alias) === normalizedTitle));
+}
+
+function titleAliasRecord(item) {
+  const aliases = [...new Set([item.title, item.englishTitle, ...splitAliases(item.aliases), ...splitAliases(item.synonym)].filter(Boolean))];
+  const normalizedTitle = normalizeSearchText(item.title);
+  const known = findTitleAlias(item);
+  const mergedAliases = [...new Set([...aliases, ...(known?.aliases || [])])];
+  const suffix = known?.title && item.title && normalizeSearchText(item.title).startsWith(normalizeSearchText(known.title)) ? String(item.title).slice(String(known.title).length).trim().replace(/^[:：-]\s*/, "") : "";
+  const knownEnglish = known?.englishTitle ? `${known.englishTitle}${suffix ? ` ${suffix}` : ""}` : "";
+  return { ...item, englishTitle: knownEnglish || item.englishTitle || mergedAliases.find((alias) => normalizeSearchText(alias) !== normalizedTitle && /^[\p{L}\p{N} ]+$/u.test(alias)) || "", aliases: mergedAliases };
+}
+
+function matchesTitle(item, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) return true;
+  const enriched = item.aliases && Object.prototype.hasOwnProperty.call(item, "englishTitle") ? item : titleAliasRecord(item);
+  return [enriched.title, enriched.englishTitle, ...(enriched.aliases || [])].some((value) => normalizeSearchText(value).includes(normalizedQuery));
+}
+
+function uniqueBySlug(items) {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set();
+  /* Temuan fuzz Manas 8 Okt: elemen ber-Proxy yang throw saat get membuat
+     item?.slug melempar; elemen macam itu dilewati, bukan menjatuhkan route. */
+  return items.filter((item) => {
+    try {
+      return item?.slug && !seen.has(item.slug) && seen.add(item.slug);
+    } catch {
+      return false;
+    }
+  });
+}
+
+function episodeNumber(value, fallback) {
+  const match = String(value || "").match(/(?:episode|eps?|ep)?\s*(\d+(?:\.\d+)?)/i);
+  const number = match ? Number(match[1]) : NaN;
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function normalizeEpisodes(episodes = []) {
+  /* null dan non-array membuat .map melempar; jawaban kosong yang aman
+     supaya route detail tidak 500 massal saat struktur upstream berubah. */
+  if (!Array.isArray(episodes)) return [];
+  /* Temuan fuzz Manas 8 Okt: elemen ber-Proxy yang throw saat get membuat
+     episode?.slug melempar; elemen macam itu dilewati (slug kosong), bukan
+     menjatuhkan route detail. */
+  return episodes
+    .map((episode, index) => {
+      try {
+        return {
+          number: episodeNumber(episode?.episode || episode?.title, index + 1),
+          title: episode?.episode || episode?.title || `Episode ${index + 1}`,
+          slug: episode?.slug || "",
+          sourceUrl: episode?.sourceUrl || "",
+          sourceProvider: episode?.sourceProvider || "",
+          sourceIndex: index,
+        };
+      } catch {
+        return { number: index + 1, title: `Episode ${index + 1}`, slug: "", sourceUrl: "", sourceProvider: "", sourceIndex: index };
+      }
+    })
+    .filter((episode) => episode.slug)
+    .sort((left, right) => left.number - right.number || left.sourceIndex - right.sourceIndex)
+    .map(({ sourceIndex, ...episode }) => episode);
+}
+
+function slices(items) {
+  return Array.from({ length: Math.ceil(items.length / SLIDE_SIZE) }, (_, index) => items.slice(index * SLIDE_SIZE, (index + 1) * SLIDE_SIZE));
+}
+
+function todayKey(date = new Date()) {
+  const weekday = new Intl.DateTimeFormat("id-ID", { weekday: "long", timeZone: USER_TIME_ZONE }).format(date).toLowerCase();
+  return DAY_KEYS.includes(weekday) ? weekday : "minggu";
+}
+
+function todayLabel(date = new Date()) {
+  return new Intl.DateTimeFormat("id-ID", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: USER_TIME_ZONE }).format(date);
+}
+
+async function dailyAnime() {
+  const day = todayKey();
+  const { result } = await sourceRequest("/jadwal/", { headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS });
+  const scheduled = uniqueBySlug(parseDailyCards(result.data, day));
+  if (!scheduled.length) throw new Error("Animasu tidak mengembalikan jadwal untuk hari ini.");
+  return scheduled.map((anime) => titleAliasRecord({ ...anime, type: anime.type || "Series", episode: anime.episode || "Rilis hari ini", status: "NEW TODAY", daily: true, sourceProvider: "animasu" }));
+}
+
+async function dailyFromProvider() {
+  return dailyAnime();
+}
+
+async function dailyWithSources() {
+  let lastError;
+  for (const source of SOURCE_CONFIGS) {
+    try { return { data: await dailyFromProvider(source.id), provider: source.id }; } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error("Tidak ada source anime yang dapat diakses.");
+}
+
+async function genresWithSources() {
+  let lastError;
+  for (const source of SOURCE_CONFIGS) {
+    try {
+      const { result } = await sourceRequestFor(source.id, "/", { headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS });
+      const data = parseGenreLinks(result.data, source.baseUrl);
+      if (data.length) return { data, provider: source.id };
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error("Tidak ada source anime yang mengembalikan genre.");
+}
+
+/* ---------- Rekomendasi: Animasu untuk kartu, AniList untuk rating/view ----------
+   AniList tidak punya slug Animasu, jadi arahnya dibalik: kartu diambil dari
+   katalog Animasu dulu, lalu judulnya dicocokkan ke AniList. Dengan begitu
+   setiap kartu tetap bisa dibuka dan diputar lewat route yang sudah ada. */
+
+function titleForAniList(value) {
+  return teksAman(value)
+    .replace(/\b(sub\s*indo|subtitle\s*indonesia|subtitle|serial)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleTokens(value) {
+  return new Set(normalizeSearchText(value).split(" ").filter((token) => token.length > 1));
+}
+
+/* Skor containment, bukan Jaccard: judul AniList sering lebih panjang
+   ("... Part 7: Steel Ball Run") daripada judul Animasu. Yang penting judul
+   pendeknya termuat utuh, bukan panjang keduanya sama. */
+function titleMatchScore(query, candidate) {
+  const a = titleTokens(query);
+  const b = titleTokens(candidate);
+  if (!a.size || !b.size) return 0;
+  let overlap = 0;
+  for (const token of a) if (b.has(token)) overlap += 1;
+  return overlap / Math.min(a.size, b.size);
+}
+
+function bestAniListMatch(item, media) {
+  const candidates = [media?.title?.romaji, media?.title?.english, media?.title?.native, ...(media?.synonyms || [])].filter(Boolean);
+  const queries = [item.title, item.englishTitle, item.synonym].filter(Boolean);
+  let best = 0;
+  for (const query of queries) for (const candidate of candidates) best = Math.max(best, titleMatchScore(query, candidate));
+  return best;
+}
+
+/* Satu request GraphQL untuk banyak judul. Kalau SATU alias tidak ditemukan,
+   AniList membalas 404 dan mengosongkan SELURUH data - bukan cuma alias itu.
+   Karena itu error dipecah dua sampai alias yang bermasalah terisolasi;
+   judul yang valid tetap mendapat rating tanpa harus menembak satu per satu
+   sejak awal. */
+async function queryAniListChunk(chunk, hasil) {
+  if (!chunk.length || Date.now() < anilistCooldownUntil) return;
+  const fields = chunk.map((entry, i) => `m${i}: Media(search: ${JSON.stringify(entry.query)}, type: ANIME) { averageScore popularity siteUrl synonyms title { romaji english native } }`).join("\n");
+  let response;
+  try {
+    response = await axios.post(ANILIST_ENDPOINT, { query: `query {\n${fields}\n}` }, {
+      timeout: ANILIST_TIMEOUT_MS,
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      validateStatus: ANILIST_ACCEPT_STATUS,
+    });
+  } catch (error) {
+    /* Rekomendasi tidak boleh menjatuhkan beranda. */
+    console.error(`AniList gagal: ${error.message}`);
+    return;
+  }
+  if (response.status === 429) {
+    anilistCooldownUntil = Date.now() + 60_000;
+    anilistRateLimited = true;
+    console.error("AniList gagal: rate limit 429");
+    return;
+  }
+  const payload = response.data || {};
+  const errors = Array.isArray(payload.errors) ? payload.errors : [];
+  if (errors.length && chunk.length > 1) {
+    const mid = Math.ceil(chunk.length / 2);
+    await queryAniListChunk(chunk.slice(0, mid), hasil);
+    await queryAniListChunk(chunk.slice(mid), hasil);
+    return;
+  }
+  if (errors.length) return;
+  const media = payload.data || {};
+  chunk.forEach((entry, i) => {
+    const found = media[`m${i}`];
+    if (!found) return;
+    const score = bestAniListMatch(entry.item, found);
+    if (score < 0.45) return;
+    hasil.set(entry.index, {
+      score: Number(found.averageScore) || 0,
+      popularity: Number(found.popularity) || 0,
+      url: found.siteUrl || "",
+      title: found.title?.english || found.title?.romaji || "",
+      matchScore: score,
+    });
+  });
+}
+
+async function fetchAniListBatch(items = []) {
+  const hasil = new Map();
+  anilistRateLimited = Date.now() < anilistCooldownUntil;
+  const pending = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const query = titleForAniList(item.englishTitle || item.synonym || item.title);
+    if (query.length < 2) continue;
+    const cache = anilistCacheGet(query);
+    if (cache.hit) { if (cache.value) hasil.set(index, cache.value); continue; }
+    pending.push({ item, index, query });
+  }
+  for (let start = 0; start < pending.length; start += 10) {
+    await queryAniListChunk(pending.slice(start, start + 10), hasil);
+  }
+  /* Hasil positif selalu aman disimpan. Hasil kosong hanya disimpan kalau
+     bukan karena rate limit; 429 bukan bukti judulnya tidak ada. */
+  for (const entry of pending) {
+    const value = hasil.get(entry.index);
+    if (value || !anilistRateLimited) anilistCacheSet(entry.query, value || null);
+  }
+  return hasil;
+}
+
+function sortRecommendations(items = [], limit = REC_LIMIT) {
+  return [...items]
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => (Number(b.item.rating) || 0) - (Number(a.item.rating) || 0)
+      || (Number(b.item.views) || 0) - (Number(a.item.views) || 0)
+      || a.index - b.index)
+    .slice(0, limit)
+    .map((entry) => entry.item);
+}
+
+async function enrichRecommendations(items = [], limit = REC_LIMIT) {
+  const pool = (Array.isArray(items) ? items : []).filter((item) => item?.slug && item?.title).slice(0, 20);
+  const metadata = await fetchAniListBatch(pool);
+  const enriched = pool.map((item, index) => {
+    const found = metadata.get(index);
+    return {
+      ...item,
+      rating: found?.score ? Number((found.score / 10).toFixed(1)) : Number(item.rating) || 0,
+      views: found?.popularity || Number(item.views) || 0,
+      anilistUrl: found?.url || "",
+      anilistTitle: found?.title || "",
+      anilistMatched: Boolean(found),
+    };
+  });
+  return sortRecommendations(enriched, limit);
+}
+
+async function fetchGenreDirectory() {
+  return cached("genres:directory", async () => {
+    const { result } = await sourceRequest("/kumpulan-genre-anime-lengkap/", { headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS });
+    const data = parseGenreLinks(result.data, ANIMASU_BASE_URL);
+    if (!data.length) throw new Error("Animasu tidak mengembalikan daftar genre.");
+    return data;
+  }, 24 * 60 * 60 * 1000, true);
+}
+
+async function resolveGenreSlug(name) {
+  const key = normalizeSearchText(name);
+  if (!key) return "";
+  const list = await fetchGenreDirectory().catch(() => []);
+  const found = list.find((genre) => normalizeSearchText(genre.name) === key) || list.find((genre) => normalizeSearchText(genre.slug) === key);
+  return found?.slug || slugifyTitle(name);
+}
+
+async function popularRecommendations() {
+  const daily = await cached(`daily:${todayKey()}`, dailyWithSources, DAILY_CACHE_MS, true);
+  return { data: await enrichRecommendations(daily?.data || [], REC_LIMIT), genre: "", genreSlug: "", provider: "animasu" };
+}
+
+async function genreRecommendations(genreName) {
+  const genreSlug = await resolveGenreSlug(genreName);
+  if (!genreSlug) return { data: [], genre: genreName, genreSlug: "", provider: "animasu", notice: "Genre tidak dikenali." };
+  const { result } = await sourceRequest(`/genre/${encodeURIComponent(genreSlug)}/`, { headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS });
+  const cards = uniqueBySlug(parseAnimeCards(result.data));
+  return { data: await enrichRecommendations(cards, REC_LIMIT), genre: genreName, genreSlug, provider: "animasu" };
+}
+
+function absoluteUrl(value, baseUrl = ANIMASU_BASE_URL) {
+  if (!value) return "";
+  try { return new URL(value, baseUrl).toString(); } catch { return value.startsWith("//") ? `https:${value}` : value; }
+}
+
+const SOURCE_HEADERS = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", Accept: "text/html,application/xhtml+xml" };
+const SOURCE_CONFIGS = [{ id: "animasu", baseUrl: ANIMASU_BASE_URL, kind: "animasu" }];
+const SOURCE_BASE_URLS = SOURCE_CONFIGS.map((source) => source.baseUrl);
+/* Samehadaku SENGAJA tidak masuk SOURCE_CONFIGS. Fungsi dailyWithSources() dan
+   genresWithSources() mencoba setiap sumber sebagai cadangan, dan markup
+   Samehadaku tidak punya .bixbox maupun /genre/. Kalau ikut di sana, ia hanya
+   menambah cadangan yang mengembalikan daftar kosong — atau lebih buruk, menggeser
+   katalog ke sumber yang tidak bisa diparse. Ia hanya boleh lewat sebagai
+   penyumbang episode, lewat getSourceConfig() di bawah. */
+const MIRROR_ONLY_SOURCES = [
+  { id: "samehadaku", baseUrl: SAMEHADAKU_BASE_URL, kind: "samehadaku" },
+  { id: "hianimetv", baseUrl: HIANIME_BASE_URL, kind: "hianimetv" },
+];
+function isBlockedSourceHtml(html) {
+  const text = String(html || "").toLowerCase();
+  return text.includes("cf-chl-") || text.includes("just a moment") || (text.includes("cloudflare") && (text.includes("checking your browser") || text.includes("verify you are human")));
+}
+/* 403 tidak selalu berarti diblokir, dan ini satu-satunya tempat yang
+   memutuskan. Samehadaku membalas 403 saat kena rate limit, dan tetap
+   mengirim HTML halaman yang utuh - statusnya jelek, isinya tetap bisa
+   di-parse. Diuji langsung: `curl "/?s=naruto"` balas 403 dengan body
+   108 KB berisi `<title>Search Results for "naruto" – Samehadaku</title>`.
+
+   Dulu aturan ini ada di DUA tempat sekaligus - validateStatus per-panggilan
+   di fetchSamehadakuEpisodes, lalu lagi di sourceRequestFor - dan keduanya
+   menolak 403 apa pun. Efeknya halaman yang sempurna good hilang tanpa
+   suara: Samehadakusering menjawab, lalu jawabannya dibuang karena angka
+   statusnya jelek.
+
+   Yang tetap ditolak: 403 yang isinya halaman challenge Cloudflare.
+   Body-nya baru diperiksa SETELAH lewat sini, di isBlockedSourceHtml. Jadi
+   blokir sungguhan tetap dapat jawaban "tidak" - hanya nomor status yang
+   tidak lagi jadi bukti. */
+const SOURCE_ACCEPT_STATUS = (status) => (status >= 200 && status < 300) || status === 403;
+/* Halaman abjad boleh mengikuti redirect: /daftar-anime/page/N/ kadang
+   dipindahkan ke path lain. Aturannya sengaja BERBEDA dari
+   SOURCE_ACCEPT_STATUS, tapi tetap diberi nama supaya tidak ada
+   validateStatus anonim yang menulis angkanya sendiri - dua-duanya
+   melenceng diam-diam kalau ditulis inline. */
+const SOURCE_ACCEPT_REDIRECT = (status) => SOURCE_ACCEPT_STATUS(status) || (status >= 300 && status < 400);
+function isUsableSourceBody(html) {
+  return String(html || "").trim().length > 0;
+}
+function getSourceConfig(provider = "animasu") {
+  return [...SOURCE_CONFIGS, ...MIRROR_ONLY_SOURCES].find((source) => source.id === provider) || SOURCE_CONFIGS[0];
+}
+/* Status HTTP untuk kegagalan baca dari source.
+   404 = judulnya memang tidak ada (fakta, tidak akan berubah dengan
+   menunggu); 502 = sumber sedang mati atau tidak bisa dibaca (kondisi,
+   mungkin pulih). Dua hal ini beda bagi pengguna, jadi jangan dicampur.
+   Ditemukan saat fuzz: belasan slug sampah semuanya dibalas 502 "source
+   tidak dapat membaca", padahal upstream sebenarnya membalas 404. */
+function detailErrorStatus(error) {
+  return error?.notFound ? 404 : 502;
+}
+
+/* Apakah anime ini masih tayang?
+   Status sumber berbahasa Indonesia ("Sedang Tayang", "Selesai"), dan
+   badge katalog memakai api (yang berarti tayang). Karena itu pola
+   "selesai" diperiksa lebih dulu - kalau tidak, kata "tayang" yang
+   ada di dalam "Selesai" bisa menipu.
+   "UPCOMING" sengaja TIDAK dihitung tayang: di parser katalog itu
+   berarti "badge tidak dikenali", bukan fakta. */
+function statusOngoing(status) {
+  const t = String(status || "").toLowerCase();
+  if (!t.trim()) return false;
+  if (/selesai|completed|complete|ended|finished|tamat/.test(t)) return false;
+  if (/sedang tayang|ongoing|airing|berjalan|running|baru|new today|tayang|\u{1F525}/u.test(t)) return true;
+  return false;
+}
+async function sourceRequestFor(provider, pathname, options = {}, lane = "default") {
+  const source = getSourceConfig(provider);
+  try {
+    const result = await upstreamRequest(options.method || "get", new URL(pathname, source.baseUrl).toString(), options, lane);
+    /* Gerbang kedua. validateStatus per-panggilan sudah menyaring lebih
+       dulu, tapi respons yang lolos ke sini tetap diperiksa - supaya
+       aturan "403 = gagal" tidak hidup di dua tempat berbeda.
+
+       403 hanya lolos kalau body-nya bisa dipakai DAN bukan halaman
+       blokir. Pemeriksaan Cloudflare tetap di bawah, tidak dilewati. */
+    const oke = SOURCE_ACCEPT_STATUS(result.status);
+    const forbiddenTapiBerguna = result.status === 403
+      && !isBlockedSourceHtml(result.data)
+      && isUsableSourceBody(result.data);
+    if (!oke && !forbiddenTapiBerguna) {
+      const error = new Error(`${source.id} HTTP ${result.status}`);
+      error.sourceBlocked = result.status === 403 || result.status === 429;
+      /* 404 = judulnya memang tidak ada di source. Beda dari "sumber
+         mati" (502): yang satu fakta, yang satu kondisi. Tanpa penanda
+         ini, app menampilkan "source tidak bisa membaca" untuk anime
+         yang memang tidak pernah ada. */
+      error.notFound = result.status === 404;
+      throw error;
+    }
+    if (isBlockedSourceHtml(result.data)) {
+      const error = new Error(`${source.id} mengembalikan halaman block/Cloudflare`);
+      error.sourceBlocked = true;
+      throw error;
+    }
+    markSourceSuccess(source.baseUrl, source.id);
+    return { result, source };
+  } catch (error) {
+    const status = error?.response?.status;
+    if (status === 403 || status === 429 || /block|cloudflare/i.test(error?.message || "")) error.sourceBlocked = true;
+    /* 404 = judulnya tidak ada di source. Datang dari error fetch itu
+       sendiri (fetch menolak status di luar validateStatus), jadi
+       penandanya dipasang DI SINI - bukan hanya di cabang "status
+       ditolak" di atas, karena error fetch tidak pernah sampai ke sana. */
+    if (status === 404) error.notFound = true;
+    error.sourceId = source.id;
+    error.baseUrl = source.baseUrl;
+    if (isSourceUnavailable(error)) markSourceFailure(error);
+    throw error;
+  }
+}
+async function sourceRequest(pathname, options = {}, lane = "default") {
+  const { result, source } = await sourceRequestFor("animasu", pathname, options, lane);
+  return { result, baseUrl: source.baseUrl };
+}
+function originFor(url) {
+  try { return new URL(url).origin; } catch { return "unknown"; }
+}
+function scheduleUpstreamDrain(delayMs) {
+  if (upstreamDrainTimer) return;
+  upstreamDrainTimer = setTimeout(() => { upstreamDrainTimer = null; drainUpstreamQueue(); }, Math.max(0, delayMs));
+}
+function laneLimit(lane) { return lane === "search" ? SEARCH_UPSTREAM_CONCURRENCY : MAX_UPSTREAM_CONCURRENCY; }
+function laneInterval(lane) { return lane === "search" ? SEARCH_UPSTREAM_MIN_INTERVAL_MS : UPSTREAM_MIN_INTERVAL_MS; }
+function laneOriginKey(lane, origin) { return `${lane}:${origin}`; }
+function drainUpstreamQueue() {
+  let nextDelay = Infinity;
+  while (upstreamQueue.length) {
+    const now = Date.now();
+    let selectedIndex = -1;
+    for (let index = 0; index < upstreamQueue.length; index += 1) {
+      const request = upstreamQueue[index];
+      if (request.options.signal?.aborted) { upstreamQueue.splice(index, 1)[0].reject(new Error("Upstream request dibatalkan oleh client.")); index -= 1; continue; }
+      const active = upstreamActiveByLaneOrigin.get(laneOriginKey(request.lane, request.origin)) || 0;
+      if (active >= laneLimit(request.lane)) continue;
+      const origin = request.origin;
+      const cooldown = upstreamCooldownUntil.get(origin) || 0;
+      if (cooldown > now) { nextDelay = Math.min(nextDelay, cooldown - now); continue; }
+      const key = laneOriginKey(request.lane, origin);
+      const nextAllowed = (upstreamLastStartedByLane.get(key) || 0) + laneInterval(request.lane);
+      if (nextAllowed > now) { nextDelay = Math.min(nextDelay, nextAllowed - now); continue; }
+      selectedIndex = index;
+      break;
+    }
+    if (selectedIndex < 0) break;
+    const request = upstreamQueue.splice(selectedIndex, 1)[0];
+    const origin = request.origin;
+    const key = laneOriginKey(request.lane, origin);
+    const nowStart = Date.now();
+    upstreamLastStarted.set(origin, nowStart);
+    upstreamLastStartedByLane.set(key, nowStart);
+    upstreamActive += 1;
+    const activeKey = laneOriginKey(request.lane, origin);
+    upstreamActiveByLaneOrigin.set(activeKey, (upstreamActiveByLaneOrigin.get(activeKey) || 0) + 1);
+    axios.request({ ...request.options, method: request.method || "get", url: request.url }).then((result) => {
+      if (result.status === 403 || result.status === 429) { upstreamCooldownUntil.set(origin, Date.now() + SOURCE_BLOCK_COOLDOWN_MS); capMap(upstreamCooldownUntil); }
+      request.resolve(result);
+    }, (error) => {
+      if (error?.response?.status === 403 || error?.response?.status === 429) { upstreamCooldownUntil.set(origin, Date.now() + SOURCE_BLOCK_COOLDOWN_MS); capMap(upstreamCooldownUntil); }
+      request.reject(error);
+    }).finally(() => {
+      upstreamActive -= 1;
+      const active = Math.max(0, (upstreamActiveByLaneOrigin.get(activeKey) || 1) - 1);
+      if (active) upstreamActiveByLaneOrigin.set(activeKey, active); else upstreamActiveByLaneOrigin.delete(activeKey);
+      drainUpstreamQueue();
+    });
+  }
+  if (Number.isFinite(nextDelay)) scheduleUpstreamDrain(nextDelay);
+}
+/* Antrean upstream tidak lagi hanya GET: API hianimes.se memakai POST
+   /filter dengan body JSON. Method dibawa per-request supaya GET yang sudah
+   ada tidak berubah perilakunya. */
+function upstreamRequest(method, url, options = {}, lane = "default") {
+  return new Promise((resolve, reject) => { upstreamQueue.push({ method: String(method || "get").toLowerCase(), url, origin: originFor(url), options, lane, resolve, reject }); drainUpstreamQueue(); });
+}
+function upstreamGet(url, options = {}, lane = "default") {
+  return upstreamRequest("get", url, options, lane);
+}
+function withTimeout(task, timeoutMs, label) {
+  let timer;
+  /* task dijalankan lewat .then supaya pengecualian sinkron pun jadi
+     rejection. Nilai non-fungsi tetap diterima: .then(nonFungsi) akan
+     menghasilkan undefined, dan itu pernah membuat mirror HiAnime hilang
+     tanpa error. */
+  const run = typeof task === "function" ? task : () => task;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timeout setelah ${timeoutMs}ms`)), timeoutMs); });
+  return Promise.race([Promise.resolve().then(run), timeout]).finally(() => clearTimeout(timer));
+}
+function transientUpstreamError(error) {
+  const status = error?.response?.status;
+  return !error?.sourceBlocked && (!status || status === 408 || status === 425 || status === 429 || status >= 500);
+}
+async function withRetry(task, retries, backoffMs, signal) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    if (signal?.aborted) throw new Error("Pencarian dibatalkan oleh client.");
+    try { return await task(attempt); } catch (error) {
+      lastError = error;
+      if (attempt >= retries || !transientUpstreamError(error)) throw error;
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, backoffMs * (attempt + 1));
+        signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("Pencarian dibatalkan oleh client.")); }, { once: true });
+      });
+    }
+  }
+  throw lastError;
+}
+function aktifPerLane() {
+  const hasil = {};
+  for (const [key, jumlah] of upstreamActiveByLaneOrigin) {
+    const lane = key.slice(0, key.indexOf(":"));
+    hasil[lane] = (hasil[lane] || 0) + jumlah;
+  }
+  return hasil;
+}
+function runtimeStats() { return { cacheEntries: memory.size, pendingKeys: pending.size, upstreamActive, upstreamQueued: upstreamQueue.length, upstreamActiveByLane: aktifPerLane(), maxUpstreamConcurrency: MAX_UPSTREAM_CONCURRENCY, searchUpstreamConcurrency: SEARCH_UPSTREAM_CONCURRENCY, minIntervalMs: UPSTREAM_MIN_INTERVAL_MS, searchMinIntervalMs: SEARCH_UPSTREAM_MIN_INTERVAL_MS, cooldownMs: SOURCE_BLOCK_COOLDOWN_MS, rateLimit: { search: { burst: SEARCH_RATE_BURST, refillMs: SEARCH_RATE_REFILL_MS }, detail: { burst: DETAIL_RATE_BURST, refillMs: DETAIL_RATE_REFILL_MS }, streams: { burst: STREAM_RATE_BURST, refillMs: STREAM_RATE_REFILL_MS }, queueLimit: UPSTREAM_QUEUE_LIMIT, trackedClients: searchBucket.size + detailBucket.size + streamBucket.size + contentBucket.size } }; }
+/* Status PER SUMBER, bukan satu objek global.
+
+   Sebelumnya Animasu dan Samehadaku menulis ke objek yang sama. Satu 403
+   dari mirror bikin /api/health melaporkan sumber utama "down" padahal
+   Animasu baik-baik saja - dan lebih buruk, karena keduanya menimpa satu
+   yang lain, "supplementing diam-diam mati" juga tidak pernah terlihat:
+   status yang tampil cuma milik whichever yang bicara terakhir.
+
+   Dengan ember terpisah, mirror mati ≠ utama mati, dan keduanya bisa
+   dilaporkan tanpa saling menimpa. */
+const sourceStates = new Map();
+function stateFor(sourceId = "animasu", baseUrl = "") {
+  if (!sourceStates.has(sourceId)) sourceStates.set(sourceId, { sourceId, baseUrl, status: "unknown", lastSuccessAt: null, lastAttemptAt: null, lastError: null });
+  return sourceStates.get(sourceId);
+}
+function markSourceSuccess(baseUrl, sourceId = "animasu") {
+  const state = stateFor(sourceId, baseUrl);
+  state.status = "up"; state.baseUrl = baseUrl; state.lastSuccessAt = new Date().toISOString(); state.lastAttemptAt = state.lastSuccessAt; state.lastError = null;
+}
+function markSourceFailure(error) {
+  const sourceId = error?.sourceId || "animasu";
+  const state = stateFor(sourceId, error?.baseUrl || stateFor(sourceId).baseUrl);
+  state.status = "down"; state.lastError = error?.message || String(error); state.lastAttemptAt = new Date().toISOString();
+}
+/* Sumber utama tetap punya jawabannya sendiri untuk health publik. */
+function primarySourceState() { return stateFor(SOURCE_CONFIGS[0].id, SOURCE_CONFIGS[0].baseUrl); }
+function snapshotSourceStates() {
+  return [...SOURCE_CONFIGS, ...MIRROR_ONLY_SOURCES].map((source) => {
+    const state = stateFor(source.id, source.baseUrl);
+    return { id: source.id, baseUrl: source.baseUrl, status: state.status, lastSuccessAt: state.lastSuccessAt, lastAttemptAt: state.lastAttemptAt, lastError: state.lastError };
+  });
+}
+/* 404/410 berarti pola URL yang dicoba tidak ada, bukan sumber mati.
+   Tanpa ini, satu halaman yang gagal lalu digantikan path fallback yang
+   sukses tetap menandai source "down", jadi /api/health melaporkan outage
+   padahal pencarian berjalan normal. */
+function isSourceUnavailable(error) {
+  const fromResponse = Number(error?.response?.status) || 0;
+  const fromMessage = Number((/\bHTTP (\d{3})\b/.exec(String(error?.message || "")) || [])[1]) || 0;
+  const code = fromResponse || fromMessage;
+  return code !== 404 && code !== 410;
+}
+/* ---------- Rate limit: token bucket per IP ----------
+   Sliding window lama menyimpan array timestamp per IP: alokasi per request,
+   bisa "dilewati" di batas menit, dan tetap memotong kuota untuk request yang
+   sebenarnya dilayani cache. Token bucket menggantinya: satu objek per IP,
+   laju jangka panjang = 60000 / refillMs token per menit, dan request yang
+   dilayani cache atau sedang di-pending tidak diambilkan token sama sekali. */
+function createTokenBucket({ capacity, refillMs, maxKeys = RATE_LIMIT_MAX_KEYS, clock = () => Date.now() }) {
+  const buckets = new Map();
+  let lastSweep = 0;
+  function sweep(t, keepKey) {
+    if (t - lastSweep < 60_000) return;
+    lastSweep = t;
+    for (const [storedKey, bucket] of buckets) {
+      if (storedKey === keepKey) continue;
+      if (bucket.tokens >= capacity || t - bucket.updatedAt >= refillMs * capacity) buckets.delete(storedKey);
+      if (buckets.size <= maxKeys) return;
+    }
+    while (buckets.size > maxKeys) {
+      const oldestKey = buckets.keys().next().value;
+      if (oldestKey === keepKey) break;
+      buckets.delete(oldestKey);
+    }
+  }
+  return {
+    take(key, cost = 1) {
+      const t = clock();
+      let bucket = buckets.get(key);
+      if (!bucket) { bucket = { tokens: capacity, updatedAt: t }; buckets.set(key, bucket); }
+      else {
+        const elapsed = t - bucket.updatedAt;
+        if (elapsed > 0) {
+          bucket.tokens = Math.min(capacity, bucket.tokens + elapsed / refillMs);
+          bucket.updatedAt = t;
+        }
+      }
+      sweep(t, key);
+      if (bucket.tokens < cost) {
+        const retryAfterMs = Math.max(1, Math.ceil((cost - bucket.tokens) * refillMs));
+        return { allowed: false, retryAfterMs, remaining: 0 };
+      }
+      bucket.tokens -= cost;
+      return { allowed: true, retryAfterMs: 0, remaining: Math.floor(bucket.tokens) };
+    },
+    peek(key) { const bucket = buckets.get(key); return bucket ? Math.floor(bucket.tokens) : capacity; },
+    get size() { return buckets.size; },
+  };
+}
+
+const searchBucket = createTokenBucket({ capacity: SEARCH_RATE_BURST, refillMs: SEARCH_RATE_REFILL_MS });
+const detailBucket = createTokenBucket({ capacity: DETAIL_RATE_BURST, refillMs: DETAIL_RATE_REFILL_MS });
+const streamBucket = createTokenBucket({ capacity: STREAM_RATE_BURST, refillMs: STREAM_RATE_REFILL_MS });
+const contentBucket = createTokenBucket({ capacity: CONTENT_RATE_BURST, refillMs: CONTENT_RATE_REFILL_MS });
+/* Resolver unduhan tidak menembak upstream dan tidak mengalirkan byte
+   file: satu klik = satu 302, bukan satu permintaan per gigabyte. Bucket
+   terpisah supaya klik unduhan tidak memotong kuota mirror atau pencarian.
+   60 burst terlalu sempit kalau satu kelas memakai satu IP NAT; 240 burst
+   + 4/detik tetap membatasi skrip, tetapi tidak menghukum ukuran file. */
+const downloadBucket = createTokenBucket({ capacity: 240, refillMs: 250 });
+
+/* ---------- Laporan tautan mati dari pengguna ----------
+   Satu pengguna yang menemukan tautan/mirror mati bisa menolong pengguna
+   lain: laporan dikirim ke sini, digabung per tautan, dan baru dianggap
+   cukup kalau datang dari beberapa pelapor BERBEDA. Pelapor bukan IP:
+   browser membuat id acak sekali (localStorage) dan server hanya menyimpan
+   hash-nya, jadi IP tidak pernah disimpan maupun dikirim balik. Yang
+   dilaporkan juga bukan URL, melainkan hash pendek dari URL (sidikTautan
+   di klien), jadi server ini tidak menyimpan tautan host mana pun. */
+const LAPORAN_TTL_MS = Number(process.env.LAPORAN_TTL_MS) > 0 ? Number(process.env.LAPORAN_TTL_MS) : 30 * 24 * 60 * 60 * 1000;
+const LAPORAN_AMBANG = Number(process.env.LAPORAN_AMBANG) > 0 ? Number(process.env.LAPORAN_AMBANG) : 2;
+const LAPORAN_BATAS = Number(process.env.LAPORAN_BATAS) > 0 ? Number(process.env.LAPORAN_BATAS) : 2000;
+const LAPORAN_BERKAS = process.env.ILN_LAPORAN_FILE || path.join(__dirname, "data", "laporan-tautan.json");
+const laporanMati = new Map();
+const laporanBucket = createTokenBucket({ capacity: 8, refillMs: 4000 });
+const laporanBacaBucket = createTokenBucket({ capacity: 90, refillMs: 1000 });
+const POLA_ID_LAPORAN = /^t[0-9a-z]{2,20}$/;
+const POLA_SLUG_LAPORAN = /^[a-z0-9][a-z0-9-]{0,119}$/;
+const POLA_PELAPOR = /^[a-z0-9-]{12,64}$/;
+
+function kunciLaporanTautan({ jenis, id, episode = "" }) {
+  return jenis === "mirror" ? `mirror|${episode}|${id}` : `unduhan|${id}`;
+}
+
+function normalisasiLaporanTautan(body) {
+  if (!body || typeof body !== "object") return null;
+  const jenis = String(body.jenis || "").trim().toLowerCase();
+  const id = String(body.id || "").trim().toLowerCase();
+  const pelapor = String(body.pelapor || "").trim().toLowerCase();
+  const episode = String(body.episode || "").trim().toLowerCase();
+  if (jenis !== "unduhan" && jenis !== "mirror") return null;
+  if (!POLA_ID_LAPORAN.test(id)) return null;
+  if (!POLA_PELAPOR.test(pelapor)) return null;
+  if (jenis === "mirror" && !POLA_SLUG_LAPORAN.test(episode)) return null;
+  return { jenis, id, pelapor, episode: jenis === "mirror" ? episode : "" };
+}
+
+/* Hash, bukan token: berkas simpanan tidak bisa dipakai untuk melacak siapa
+   pun, tetapi pelapor yang sama tetap terhitung sekali setelah restart. */
+function hashPelapor(pelapor) {
+  return crypto.createHash("sha256").update(`iln-laporan|${pelapor}`).digest("hex").slice(0, 24);
+}
+
+function bersihkanLaporanTautan(sekarang = Date.now()) {
+  for (const [kunci, entri] of laporanMati) {
+    if (!entri || sekarang - Number(entri.t) > LAPORAN_TTL_MS) laporanMati.delete(kunci);
+  }
+  while (laporanMati.size > LAPORAN_BATAS) laporanMati.delete(laporanMati.keys().next().value);
+}
+
+function catatLaporanTautan(body, sekarang = Date.now()) {
+  const data = normalisasiLaporanTautan(body);
+  if (!data) return null;
+  bersihkanLaporanTautan(sekarang);
+  const kunci = kunciLaporanTautan(data);
+  let entri = laporanMati.get(kunci);
+  if (!entri) { entri = { pelapor: new Set(), t: sekarang }; laporanMati.set(kunci, entri); }
+  entri.pelapor.add(hashPelapor(data.pelapor));
+  entri.t = sekarang;
+  jadwalkanSimpanLaporan();
+  return { kunci, jumlah: entri.pelapor.size, ambang: LAPORAN_AMBANG };
+}
+
+function laporanTautanPublik({ episode = "", sekarang = Date.now() } = {}) {
+  bersihkanLaporanTautan(sekarang);
+  const data = [];
+  for (const [kunci, entri] of laporanMati) {
+    const [jenis, bagian2, bagian3] = kunci.split("|");
+    if (jenis === "mirror") {
+      if (!episode || bagian2 !== episode) continue;
+      data.push({ jenis, id: bagian3, episode: bagian2, jumlah: entri.pelapor.size });
+    } else {
+      data.push({ jenis: "unduhan", id: bagian2, episode: "", jumlah: entri.pelapor.size });
+    }
+  }
+  return { data, ambang: LAPORAN_AMBANG, total: data.length };
+}
+
+function simpanLaporanTautanSekarang() {
+  try {
+    const item = {};
+    for (const [kunci, entri] of laporanMati) item[kunci] = { p: [...entri.pelapor], t: entri.t };
+    fs.mkdirSync(path.dirname(LAPORAN_BERKAS), { recursive: true });
+    const sementara = `${LAPORAN_BERKAS}.${process.pid}.tmp`;
+    fs.writeFileSync(sementara, JSON.stringify({ v: 1, item }));
+    fs.renameSync(sementara, LAPORAN_BERKAS);
+    return true;
+  } catch (error) {
+    console.error(`Gagal menyimpan laporan tautan: ${error.message}`);
+    return false;
+  }
+}
+
+let laporanSimpanTimer = null;
+function jadwalkanSimpanLaporan() {
+  if (laporanSimpanTimer) return;
+  laporanSimpanTimer = setTimeout(() => { laporanSimpanTimer = null; simpanLaporanTautanSekarang(); }, 500);
+  laporanSimpanTimer.unref?.();
+}
+
+function muatLaporanTautan() {
+  try {
+    if (!fs.existsSync(LAPORAN_BERKAS)) return;
+    const isi = JSON.parse(fs.readFileSync(LAPORAN_BERKAS, "utf8"));
+    const item = isi?.item && typeof isi.item === "object" ? isi.item : {};
+    const sekarang = Date.now();
+    for (const [kunci, nilai] of Object.entries(item)) {
+      const [jenis, bagian2, bagian3] = kunci.split("|");
+      const id = jenis === "mirror" ? bagian3 : bagian2;
+      const episode = jenis === "mirror" ? bagian2 : "";
+      if ((jenis !== "unduhan" && jenis !== "mirror") || !POLA_ID_LAPORAN.test(String(id || ""))) continue;
+      if (jenis === "mirror" && !POLA_SLUG_LAPORAN.test(String(episode || ""))) continue;
+      const pelapor = new Set((Array.isArray(nilai?.p) ? nilai.p : []).filter((p) => /^[a-f0-9]{16,64}$/.test(String(p))));
+      const t = Number(nilai?.t);
+      if (!pelapor.size || !Number.isFinite(t) || sekarang - t > LAPORAN_TTL_MS) continue;
+      laporanMati.set(kunci, { pelapor, t });
+    }
+  } catch (error) {
+    console.error(`Gagal membaca laporan tautan: ${error.message}`);
+  }
+}
+
+function kosongkanLaporanTautan() {
+  laporanMati.clear();
+  if (laporanSimpanTimer) { clearTimeout(laporanSimpanTimer); laporanSimpanTimer = null; }
+}
+
+muatLaporanTautan();
+
+function clientKey(request) { return request.ip || request.socket?.remoteAddress || "unknown"; }
+function rateLimitResponse(response, verdict, message) {
+  const retryAfterSeconds = Math.max(1, Math.ceil(verdict.retryAfterMs / 1000));
+  response.set("Retry-After", String(retryAfterSeconds));
+  return response.status(429).json({ data: [], slides: [], total: 0, error: message, retryAfterMs: verdict.retryAfterMs, retryAfterSeconds });
+}
+/* Antrean upstream yang sudah menumpuk = tolak seketika dengan Retry-After
+   pendek, bukan biarkan user menunggu SEARCH_BUDGET_MS lalu dapat 503. */
+function upstreamQueueGuard(request, response, next) {
+  if (upstreamQueue.length < UPSTREAM_QUEUE_LIMIT) return next();
+  return rateLimitResponse(response, { retryAfterMs: UPSTREAM_QUEUE_RETRY_MS }, "Server sedang sibuk. Coba lagi sebentar lagi.");
+}
+/* Middleware pembatas: hanya dipasang bila request benar-benar menembak
+   upstream. Kalau kunci-nya masih di cache atau sedang di-pending, request
+   itu gratis dan tidak boleh memotong kuota. */
+function upstreamBudget(bucket, isFree, message) {
+  return (request, response, next) => {
+    if (isFree && isFree(request)) return next();
+    const verdict = bucket.take(clientKey(request));
+    if (verdict.allowed) return next();
+    return rateLimitResponse(response, verdict, message);
+  };
+}
+
+function amanHtml(nilai) {
+  return String(nilai ?? "").replace(/[&<>"']/g, (karakter) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[karakter]);
+}
+
+/* Halaman error untuk route yang dibuka langsung dari tautan unduhan.
+   Jangan balas JSON: pengguna akan melihatnya sebagai halaman putih di tab
+   yang sama. Pesannya konstan, tidak ada input pengguna yang direfleksikan.
+   Opsi retryUrl dipakai 429 supaya limit burst tidak menjadi jalan buntu. */
+function halamanUnduhanGagal(response, status, pesan, opsi = {}) {
+  response.set("Cache-Control", "no-store");
+  const retryAfter = Number(opsi.retryAfter);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) response.set("Retry-After", String(Math.ceil(retryAfter)));
+  const aksi = opsi.retryUrl ? `<p><a href="${amanHtml(opsi.retryUrl)}">Coba lagi</a></p>` : "";
+  return response.status(status).type("html").send(`<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Download tidak tersedia</title><body><p>${amanHtml(pesan)}</p>${aksi}<p><a href="/">Kembali ke SoraNema</a></p></body></html>`);
+}
+
+/* Halaman perantara unduhan. Tautan di aplikasi mengarah ke sini, bukan
+   langsung ke host, supaya URL sumber tidak tertulis di href dan klik bisa
+   dihitung. Berkas tetap mengalir dari host aslinya; server ini hanya
+   menampilkan halaman dan (khusus Drive) mengarahkan ke endpoint direct. */
+function namaHostUnduhan(host) {
+  const nama = String(host || "").toLowerCase();
+  if (/(^|\.)drive(\.usercontent)?\.google\.com$/.test(nama)) return "Google Drive";
+  if (/(^|\.)mega\.(nz|co\.nz)$/.test(nama)) return "Mega";
+  if (/(^|\.)mediafire\.com$/.test(nama)) return "MediaFire";
+  if (/(^|\.)pixeldrain\.com$/.test(nama)) return "Pixeldrain";
+  return nama || "host";
+}
+
+/* Satu sumber data untuk halaman perantara DAN pop-up di aplikasi. Pop-up
+   tidak menyusun ulang host/catatan sendiri: kalau aturannya berubah di
+   sini, halaman cadangan dan pop-up ikut berubah. */
+function detailUnduhan(data) {
+  const host = namaHostUnduhan(data.host);
+  const langsung = Boolean(targetUnduhanLangsung(data.u));
+  const kedaluwarsa = new Date(data.x * 1000);
+  const catatanHost = /google drive/i.test(host)
+    ? "Google Drive bisa langsung mengunduh dari halaman ini. Kalau muncul peringatan kuota, pilih mirror lain di halaman detail."
+    : /pixeldrain/i.test(host)
+      ? "Pixeldrain menolak unduhan langsung dari situs lain. Buka halamannya, lalu klik tombol unduh di sana."
+      : /mega/i.test(host)
+        ? "Mega membuka halamannya sendiri. Unduhan berjalan lewat browser atau aplikasi Mega."
+        : "Host membuka halamannya sendiri. Klik tombol unduh di sana.";
+  const bantuan = /google drive/i.test(host)
+    ? { label: "Panduan kuota Drive", url: "/bantuan/kuota-drive/" }
+    : /pixeldrain/i.test(host)
+      ? { label: "Kenapa Pixeldrain menolak unduhan langsung?", url: "/bantuan/pixeldrain/" }
+      : null;
+  return {
+    host,
+    quality: data.q || "",
+    episode: data.r || "",
+    mirror: data.l || "",
+    expiresAt: kedaluwarsa.toISOString(),
+    expiresLabel: `${kedaluwarsa.toLocaleString("id-ID", { timeZone: "Asia/Jakarta", dateStyle: "medium", timeStyle: "short" })} WIB`,
+    direct: langsung,
+    url: data.u,
+    note: catatanHost,
+    help: bantuan,
+  };
+}
+
+function halamanUnduhan(data, token) {
+  const detail = detailUnduhan(data);
+  const host = detail.host;
+  const tujuan = amanHtml(detail.url);
+  const tokenAman = encodeURIComponent(String(token || ""));
+  const baris = [
+    detail.quality ? `<div class="row"><span>Kualitas</span><strong>${amanHtml(detail.quality)}</strong></div>` : "",
+    detail.episode ? `<div class="row"><span>Episode</span><strong>${amanHtml(detail.episode)}</strong></div>` : "",
+    detail.mirror ? `<div class="row"><span>Mirror</span><strong>${amanHtml(detail.mirror)}</strong></div>` : "",
+  ].join("");
+  const bantuan = detail.help
+    ? `<a href="${amanHtml(detail.help.url)}" target="_blank" rel="noopener">${amanHtml(detail.help.label)}</a>`
+    : "";
+  const aksi = detail.direct
+    ? `<a class="btn" href="/unduh/${tokenAman}?direct=1">Unduh dari ${amanHtml(host)}</a><a class="btn alt" href="${tujuan}" target="_blank" rel="noopener noreferrer nofollow">Buka halaman ${amanHtml(host)}</a>`
+    : `<a class="btn" href="${tujuan}" target="_blank" rel="noopener noreferrer nofollow">Buka ${amanHtml(host)}</a>`;
+  return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Unduhan - SoraNema V3</title><style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;padding:20px;background:#0D0D0D;color:#FFF;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:16px;display:flex;align-items:center;justify-content:center}
+.wrap{width:min(600px,100%)}
+.brand{display:inline-flex;align-items:center;gap:11px;margin:0 0 18px;color:#FFD700;font-weight:800;font-size:17px;letter-spacing:.02em;text-decoration:none}
+.brand i{display:grid;place-items:center;width:40px;height:40px;border-radius:11px;background:#FFD700;color:#111;font-style:normal;font-size:15px}
+.card{background:#161618;border:1px solid #26262B;border-radius:20px;padding:26px;box-shadow:0 18px 50px rgba(0,0,0,.35)}
+.eyebrow{margin:0 0 7px;color:#94A3B8;font-size:12.5px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
+h1{margin:0 0 8px;font-size:clamp(28px,6vw,36px);line-height:1.2}
+.sub{margin:0 0 20px;color:#94A3B8;font-size:15.5px;line-height:1.6}
+.rows{display:grid;gap:10px;margin:0 0 22px}
+.row{display:flex;justify-content:space-between;align-items:baseline;gap:14px;padding:12px 15px;background:#1c1c20;border:1px solid #26262B;border-radius:12px;font-size:16px}
+.row span{color:#94A3B8}
+.row strong{font-weight:700;text-align:right;font-size:17px}
+.btn{display:block;width:100%;min-height:54px;padding:15px 18px;margin:0 0 10px;border-radius:12px;background:#FFD700;color:#111;font-weight:800;font-size:17px;line-height:1.35;text-align:center;text-decoration:none}
+.btn.alt{background:#26262B;color:#FFF;border:1px solid #3a3a42;font-weight:700}
+.note{margin:16px 0 0;color:#94A3B8;font-size:15px;line-height:1.75}
+.note a{color:#FFD700}
+.foot{display:flex;flex-wrap:wrap;gap:16px;margin:18px 2px 0;font-size:15px}
+.foot a,.foot button{color:#FFD700;text-decoration:none;background:none;border:0;padding:0;font:inherit;cursor:pointer}
+@media (max-width:480px){.card{padding:22px 18px}.row{flex-direction:column;gap:3px}.row strong{text-align:left}}
+</style></head><body><main class="wrap"><a class="brand" href="/"><i>SN</i>SoraNema V3</a><section class="card"><p class="eyebrow">Link unduhan</p><h1>${amanHtml(host)}</h1><p class="sub">Halaman perantara SoraNema V3. Berkas tidak disimpan di server kami.</p><div class="rows">${baris}</div>${aksi}<p class="note">${amanHtml(detail.note)} Tautan ini berlaku sampai ${amanHtml(detail.expiresLabel)}. ${bantuan}</p></section><nav class="foot"><a href="/">Kembali ke SoraNema</a><button type="button" onclick="history.back()">Kembali ke halaman sebelumnya</button></nav></main></body></html>`;
+}
+
+/* Google Drive TIDAK diprobe sebelum redirect. Tiga percobaan membuktikan
+   probe tidak bisa dipercaya dan justru merugikan pengguna:
+   - HEAD memberi 200 text/html 0 byte untuk sebagian file besar yang sehat,
+     sehingga file 3,5 GB diblokir padahal GET-nya 206.
+   - Range 0-0 membalas 206 untuk file yang browser-nya kemudian mendarat di
+     halaman kuota.
+   - GET tanpa Range bisa ikut dihitung sebagai percobaan unduh dan memicu
+     kuota untuk IP server.
+   Jadi satu klik langsung 302. Byte file mengalir dari Google ke browser,
+   bukan lewat server: ukuran 1-4 GB tidak memakai token tambahan. Kalau
+   Google menampilkan kuota, pengguna memilih mirror lain di halaman detail. */
+function downloadRateLimit(request, response, next) {
+  const verdict = downloadBucket.take(clientKey(request));
+  if (verdict.allowed) return next();
+  const retryAfterSeconds = Math.max(1, Math.ceil(verdict.retryAfterMs / 1000));
+  const token = teksAman(request.params?.token);
+  const sumber = teksAman(request.query.url);
+  const retryUrl = token
+    ? `/unduh/${encodeURIComponent(token)}?direct=1`
+    : sumber ? `/api/download?url=${encodeURIComponent(sumber)}` : "";
+  return halamanUnduhanGagal(response, 429, "Terlalu banyak permintaan unduhan. Coba lagi sebentar lagi.", { retryUrl, retryAfter: retryAfterSeconds });
+}
+function isFreshCacheKey(key, ttl = CACHE_MS) {
+  const entry = memory.get(key);
+  if (!entry) return false;
+  const freshTtl = isEmptyData(entry.data) ? Math.min(ttl, EMPTY_CACHE_MS) : ttl;
+  return Date.now() - entry.timestamp < freshTtl;
+}
+const NON_ANIME_PATHS = new Set(["page", "pencarian", "jadwal", "genre", "genres", "studio", "karakter"]);
+
+function extractSlug(value) {
+  /* Temuan fuzz Manas 8 Okt: fallback String(value) di luar try melempar
+     untuk objek dengan toString yang melempar, Proxy jahat, dan Symbol.
+     teksAman() di pintu membuat semua jalur di bawahnya pasti string. */
+  const raw = teksAman(value);
+  if (!raw) return "";
+  try {
+    const pathname = new URL(raw, ANIMASU_BASE_URL).pathname;
+    const segments = pathname.split("/").filter(Boolean);
+    const candidate = segments.at(-1) || "";
+    const slug = decodeURIComponent(candidate).trim();
+    return !slug || /^\d+$/.test(slug) || NON_ANIME_PATHS.has(slug.toLowerCase()) ? "" : slug;
+  } catch {
+    const slug = raw.split("?")[0].split("#")[0].split("/").filter(Boolean).at(-1)?.trim() || "";
+    return /^\d+$/.test(slug) || NON_ANIME_PATHS.has(slug.toLowerCase()) ? "" : slug;
+  }
+}
+
+function parseAnimeCard($, element) {
+  const card = $(element);
+  const link = card.find("a[href]").first().attr("href") || "";
+  const title = card.find(".tt, .title, .entry-title").first().text().trim();
+  const image = card.find("img").first().attr("data-src") || card.find("img").first().attr("src") || "";
+  let status = card.find(".sb").first().text().trim();
+  if (status === "🔥🔥🔥") status = "ONGOING";
+  else if (status === "Selesai ✓") status = "COMPLETE";
+  else status = "UPCOMING";
+  return { title, slug: extractSlug(link), image, type: card.find(".typez").first().text().trim(), episode: card.find(".epx").first().text().trim(), status };
+}
+
+function parseAnimeCardsWithDiagnostics(html) {
+  const $ = cheerio.load(htmlAman(html));
+  const cards = $(".bs, .listupd .bs, .list-anime .bs").map((_, element) => parseAnimeCard($, element)).get();
+  return { rawCount: cards.length, data: cards.filter((anime) => anime.title && anime.slug), missingSlug: cards.filter((anime) => anime.title && !anime.slug).map((anime) => anime.title) };
+}
+
+function parseAnimeCards(html) {
+  return parseAnimeCardsWithDiagnostics(html).data;
+}
+
+function parseGenreLinks(html, baseUrl) {
+  const $ = cheerio.load(htmlAman(html));
+  const result = [];
+  $("a[href*='/genre/'], a[href*='/category/']").each((_, element) => {
+    const anchor = $(element);
+    const name = anchor.text().replace(/\s+/g, " ").trim();
+    const href = anchor.attr("href") || "";
+    const slug = href.split("/").filter(Boolean).at(-1) || "";
+    if (name && slug && !result.some((item) => item.slug === slug)) result.push({ name, slug, sourceUrl: absoluteUrl(href, baseUrl) });
+  });
+  return result;
+}
+
+
+
+function parseDailyCards(html, day) {
+  const $ = cheerio.load(htmlAman(html));
+  const normalizedDay = String(day || "").toLowerCase();
+  const result = [];
+  $(".bixbox").each((_, element) => {
+    const box = $(element);
+    const label = box.find(".releases h3 span, .releases h3, h3").first().text().trim().toLowerCase().replace("update acak", "random").replace("'", "");
+    if (label === normalizedDay) box.find(".bs").each((__, card) => result.push(parseAnimeCard($, card)));
+  });
+  return result.filter((anime) => anime.title && anime.slug);
+}
+
+function hasNextPage(html) {
+  const $ = cheerio.load(htmlAman(html));
+  return $(".hpage .r, .pagination .next, a.next, a[rel=next]").length > 0;
+}
+
+function parseAlphabetCardsWithDiagnostics(html) {
+  const $ = cheerio.load(htmlAman(html));
+  const cards = $(".bx").map((_, element) => {
+    const card = $(element);
+    const anchor = card.find(".inx h2 a[href], h2 a[href], a[href]").first();
+    const title = anchor.text().trim() || card.find(".tt, .title").first().text().trim();
+    const image = card.find(".imgx img").first().attr("data-src") || card.find(".imgx img").first().attr("src") || "";
+    return { title, slug: extractSlug(anchor.attr("href") || ""), image, type: card.find(".inx span").eq(3).text().trim(), episode: card.find(".inx span").eq(4).text().trim().replace(", ", ""), status: card.find("[class*=status], .sb").first().text().trim() };
+  }).get();
+  return { rawCount: cards.length, data: cards.filter((anime) => anime.title && anime.slug), missingSlug: cards.filter((anime) => anime.title && !anime.slug).map((anime) => anime.title) };
+}
+
+async function fetchAlphabetPage({ letter, page = 1 }) {
+  const attempts = SOURCE_BASE_URLS.map((baseUrl) => ({ baseUrl, promise: upstreamGet(new URL(`/daftar-anime/page/${page}/`, baseUrl).toString(), { params: { show: String(letter || "").toUpperCase() }, headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_REDIRECT }) }));
+  const results = await Promise.allSettled(attempts.map((attempt) => attempt.promise));
+  let lastError;
+  for (let index = 0; index < results.length; index += 1) {
+    const result = results[index];
+    if (result.status === "rejected") { lastError = result.reason; continue; }
+    const diagnostics = parseAlphabetCardsWithDiagnostics(result.value.data);
+    if (diagnostics.rawCount) { markSourceSuccess(attempts[index].baseUrl); return { ...diagnostics, hasNext: hasNextPage(result.value.data), source: attempts[index].baseUrl }; }
+  }
+  const failure = lastError || new Error("Semua domain Animasu tidak mengembalikan daftar anime.");
+  if (isSourceUnavailable(failure)) markSourceFailure(failure);
+  throw failure;
+}
+
+/* --------------------------------------------------------------------------
+   Pencocokan lintas sumber: Animasu (katalog) + Samehadaku (episode)
+
+   Kunci pencocokan BUKAN slug. Kedua situs menyingkat musim secara berbeda:
+   Animasu menulis "black-clover-s2", Samehadaku "black-clover-season-2".
+   Dicocokkan lewat slug, hasilnya nol tanpa error — diam, bukan terlihat,
+   dan jauh lebih sulit ditelemetry daripada error yang biasa dilapor.
+
+   Yang dibandingkan adalah judul ternormalisasi. Both situs Adding "Sub Indo"
+   ke judul, jadi penanda rilis justru dibuang sebelum dibandingkan.
+   -------------------------------------------------------------------------- */
+
+/* Penanda rilis &pingsan navigasi. "movie"/"part" SENGAJA tidak ikut dibuang:
+   "Black Clover: Mahou Tei no Ken" (film) dan "Black Clover" (TV) itu entri
+   berbeda, dan membiarkan keduanya bertemu adalah cara tercepat menonton
+   episode yang salah. */
+const TITLE_NOISE = /\b(sub indo|subtitle indonesia|subtitle|indonesian|bersub|dub|bluray|bd)\b/g;
+
+function normalizeTitleKey(value) {
+  const base = normalizeSearchText(value);
+  if (!base) return "";
+  return base
+    .replace(/\bs(\d{1,2})\b/g, "season $1")
+    .replace(/\b(\d)\s*(?:st|nd|rd|th)\s*season\b/g, "season $1")
+    /* Prefix "Nonton Anime ..." dibuang sebagai FRASA, bukan kata "anime"
+      (global). Judul asli kedua situs sudah bersih, jadi ini hanya jaring
+       pengaman kalau format judul sumber berubah; membuang kata "anime" di
+       mana pun akan membuat "Anime de ..." dan "... Anime" dianggap sama. */
+    .replace(/\bnonton\s+(anime|movie)\b/g, " ")
+    .replace(TITLE_NOISE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/* Judul Inggris dari Animasu dipakai sebagai kandidat slug HiAnime.
+   Hasilnya "Red River" -> "red-river", "The World's Strongest Witch" ->
+   "the-worlds-strongest-witch". Slug ini hanya kandidat; halaman tujuan
+   tetap diverifikasi lewat h1 sebelum episodenya dipakai. */
+function slugifyTitle(value) {
+  return normalizeTitleKey(value).replace(/\s+/g, "-");
+}
+
+/* Halaman search Samehadaku memuat DUA jenis link /anime/: hasil pencarian
+   (dibungkus div.animposx) dan sidebar rekomendasi (div.imgseries). Kalau
+   keduanya ikut diambil, hampir semua query "cocok" ke film atau spin-off yang
+   tidak ada hubungannya — itulah yang membuat probe pertama selalu mendarat di
+   "Hibike Euphonium". Hanya .animposx yang dibaca. */
+function pathSlugOf(url) {
+  try { return new URL(url).pathname.split("/").filter(Boolean).at(-1) || ""; } catch { return ""; }
+}
+
+function parseSamehadakuSearch(html, baseUrl = SAMEHADAKU_BASE_URL) {
+  const $ = cheerio.load(htmlAman(html));
+  const result = [];
+  $("div.animposx a[href*='/anime/']").each((_, element) => {
+    const anchor = $(element);
+    const sourceUrl = absoluteUrl(anchor.attr("href") || "", baseUrl);
+    const title = (anchor.attr("title") || anchor.find("img").first().attr("alt") || "").trim();
+    const slug = pathSlugOf(sourceUrl);
+    if (!title || !slug || result.some((item) => item.slug === slug)) return;
+    result.push({ title, slug, key: normalizeTitleKey(title), sourceUrl });
+  });
+  return result;
+}
+
+/* Link episode Samehadaku diletakkan di root (/judul-episode-1), bukan di bawah
+   /anime/. Pola "-episode-\d+" dipakai karena itu, TAPI ada dua jenis jebakan:
+     - "/daftar-batch/" = item menu navigasi.
+     - "/judul-episode-1-24-batch" = halaman unduhan massal. Polanya tetap
+       mengandung "-episode-", jadi tanpa pengecualian ini ia terhitung sebagai
+       episode nomor 1 kedua dan membuat jumlah episode Samehadaku lebih banyak
+       daripada kenyataan (terbukti: Iruma Season 4 terbaca 25, padahal 24). */
+/* Status dari halaman Samehadaku. Markup-nya bisa berubah dan tidak
+   selalu ada, jadi ini best-effort: kalau tidak ketemu, hasilnya kosong
+   dan tidak dipakai untuk menegur. */
+function parseSamehadakuStatus($) {
+  const badge = $(".sb").first().text().trim();
+  if (badge) return badge;
+  const baris = $(".spe span").filter((_, element) => /status/i.test($(element).text())).first();
+  return baris.length ? baris.text().split(":").slice(1).join(":").trim() : "";
+}
+
+function parseSamehadakuAnime(html, sourceUrl = "", baseUrl = SAMEHADAKU_BASE_URL) {
+  const $ = cheerio.load(htmlAman(html));
+  const title = $("h1").first().text().replace(/\s+/g, " ").trim();
+  const animeSlug = pathSlugOf(sourceUrl);
+  const episodes = [];
+  const seen = new Set();
+  /* Halaman anime Samehadaku juga menautkan halaman unduhan: /batch/...
+     untuk batch, dan halaman episode di root (/judul-episode-24/). Film
+     tidak memakai "-episode-" sama sekali - halamannya berakhiran "-movie".
+     Keduanya dikumpulkan terpisah dari `episodes` supaya suplemen episode
+     tidak tiba-tiba menghitung film sebagai episode 1. */
+  const batchUrls = [];
+  const downloadSeen = new Set();
+  const downloadPages = [];
+  const originBase = (() => { try { return new URL(baseUrl).origin; } catch { return ""; } })();
+  /* Samehadaku kerap MENYINGKAT slug episode/batch. Halaman
+     /anime/tensei-shitara-dainana-ouji-datta-node-kimama-ni-majutsu-wo-kiwamemasu/
+     menautkan /tensei-shitara-dainana-ouji-datta-node-episode-12-end/ -
+     awalan slug halaman tidak sama dengan awalan slug episode. Pencocokan
+     startsWith(slug anime) karena itu menghasilkan 0 episode dan 0 batch
+     meski tautannya ada di halaman. Akar slug diturunkan dari tautan episode
+     di halaman ini, lalu hanya diterima kalau ia slug anime itu sendiri atau
+     potongan awalnya pada batas kata. */
+  const anchors = [];
+  $("a[href]").each((_, element) => {
+    const anchor = $(element);
+    const href = anchor.attr("href") || "";
+    const url = absoluteUrl(href, baseUrl);
+    /* Halaman unduhan hanya dari origin yang sama; tautan sokuja.net di
+       blok "Tonton Juga" bukan milik sumber ini. */
+    let parsed = null;
+    try { parsed = new URL(url); } catch { parsed = null; }
+    if (!parsed || (originBase && parsed.origin !== originBase)) return;
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    anchors.push({ anchor, href, url, segments, rootSlug: segments.length === 1 ? segments[0] : "" });
+  });
+  const akarSlug = new Set();
+  const tambahAkar = (candidate) => {
+    if (!candidate) return;
+    if (!animeSlug) { akarSlug.add(candidate); return; }
+    if (candidate === animeSlug || animeSlug.startsWith(`${candidate}-`)) akarSlug.add(candidate);
+  };
+  if (animeSlug) akarSlug.add(animeSlug);
+  for (const { rootSlug, segments } of anchors) {
+    const episodeSlug = rootSlug || (segments[0] === "batch" ? segments[1] || "" : "");
+    const episodeMatch = /^(.+)-episode-\d+(?:-[a-z0-9]+)*$/i.exec(episodeSlug);
+    if (episodeMatch) tambahAkar(episodeMatch[1]);
+    if (segments[0] === "batch" && segments[1]) tambahAkar(segments[1].replace(/-batch(?:-.*)?$/i, ""));
+  }
+  /* Akar terpanjang paling spesifik. Tanpa slug anime (fixture lama), semua
+     episode same-origin tetap diterima seperti sebelumnya. */
+  const roots = [...akarSlug].sort((left, right) => right.length - left.length);
+  const milikHalaman = (slug) => !animeSlug || roots.some((root) => slug === root || slug.startsWith(`${root}-`));
+  for (const { anchor, href, url, segments, rootSlug } of anchors) {
+    if (segments.length >= 2 && segments[0] === "batch" && milikHalaman(segments[1])) {
+      if (!downloadSeen.has(url)) {
+        downloadSeen.add(url);
+        batchUrls.push(url);
+      }
+    }
+    /* Halaman episode/film berada satu segmen di root, bukan di bawah
+       /anime/. Awalan slug mencegah episode anime lain yang muncul di
+       sidebar ikut terambil. */
+    if (rootSlug && milikHalaman(rootSlug) && !rootSlug.endsWith("-batch")) {
+      if (!downloadSeen.has(url)) {
+        downloadSeen.add(url);
+        const nomor = /-episode-(\d+(?:-\d+)?)/.exec(rootSlug) || /-(\d+)$/.exec(rootSlug);
+        const angka = nomor ? Number(nomor[1].replace("-", ".")) : 1;
+        downloadPages.push({ number: Number.isFinite(angka) && angka > 0 ? angka : 1, url, slug: rootSlug });
+      }
+    }
+    if (!/-episode-\d+/.test(href)) continue;
+    if (/-batch\/?$/.test(href.split(/[?#]/)[0])) continue;
+    /* Episode dari origin lain atau anime lain di sidebar bukan milik
+       halaman ini. Tanpa saringan ini, "One Piece Episode 1000" di blok
+       rekomendasi ikut terhitung sebagai episode anime yang sedang dibuka. */
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const slug = pathSlugOf(url);
+    if (!slug) continue;
+    if (!milikHalaman(slug)) continue;
+    /* Teks link Samehadaku kosong; nomor aslinya hidup di slug. Ambil dari
+       sana, jangan pakai urutan indeks - episode yang belum tayang akan
+       membuat nomor setelahnya bergeser. */
+    const fromSlug = /-episode-(\d+)/.exec(slug);
+    const label = (anchor.attr("title") || anchor.find("img").first().attr("alt") || anchor.text() || "").replace(/\s+/g, " ").trim();
+    /* Tombol nomor di tema baru hanya berisi "12", bukan judul episode.
+       Samakan bentuknya supaya daftar episode tidak campur "12" dan
+       "Episode 11". */
+    const labelEpisode = !label || /^\d+$/.test(label) ? `Episode ${fromSlug ? fromSlug[1] : episodes.length + 1}` : label;
+    episodes.push({ episode: labelEpisode, slug, sourceUrl: url, sourceProvider: "samehadaku" });
+  }
+  /* Episode terbaru dulu: kalau batch tidak ada (anime ongoing atau film),
+     halaman dengan nomor terbesar yang paling berguna. */
+  downloadPages.sort((a, b) => b.number - a.number);
+  return { title, key: normalizeTitleKey(title), episodes, batchUrls, downloadPages, status: parseSamehadakuStatus($), sourceUrl };
+}
+
+async function fetchSamehadakuEpisodes(title, synonym = "") {
+  const wanted = [...new Set([normalizeTitleKey(title), normalizeTitleKey(synonym)].filter(Boolean))];
+  if (!wanted.length) return { title: "", key: "", episodes: [] };
+  try {
+    /* Search dikirim dengan kunci yang sudah bersih. "Sub Indo" tidak ada di
+       index Samehadaku, jadi mengirimnya hanya menambah kata yang tidak pernah
+       menghasilkan hit — dan memiringkan hasil ke film atau spin-off. */
+    const search = await sourceRequestFor("samehadaku", "/", {
+      params: { s: wanted[0] }, headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+    });
+    /* Syaratnya SAMA PERSIS, bukan "mirip". Melonggarkan ke pencocokan
+       sebagian berarti film/spin-off bisa ikut terbawa sebagai episode. */
+    const match = parseSamehadakuSearch(search.result.data, search.source.baseUrl).find((item) => wanted.includes(item.key));
+    if (!match) return { title: "", key: "", episodes: [] };
+    const page = await sourceRequestFor("samehadaku", new URL(match.sourceUrl).pathname, {
+      headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+    });
+    return parseSamehadakuAnime(page.result.data, match.sourceUrl, page.source.baseUrl);
+  } catch (error) {
+    /* Sumber kedua tidak boleh menjatuhkan halaman. Kegagalan di sini berarti
+       "tidak ada tambahan", bukan "error". */
+    console.error(`Suplemen Samehadaku gagal untuk "${title}": ${error.message}`);
+    return { title: "", key: "", episodes: [] };
+  }
+}
+
+/* Unduhan dari Samehadaku. Samehadaku adalah sumber utama; Animasu hanya
+   cadangan di route unduhan. Urutannya: halaman anime (slug langsung, lalu
+   pencarian), lalu batch; kalau tidak ada batch (film/ongoing), satu halaman
+   episode terbaru. Kegagalan di sini berarti "tidak ada tambahan", bukan
+   error halaman - sama seperti suplemen episode. */
+/* Samehadaku punya halaman /anime/<slug>/ yang bisa dipanggil langsung,
+   sementara pencarian bawaannya sering hanya mengembalikan season terbaru
+   atau film (mis. "jujutsu kaisen" hanya menemukan season 3). Slug langsung
+   karena itu dicoba lebih dulu; pencarian tetap jadi cadangan kalau slug
+   tidak ada. Animasu menulis tipe rilis dalam kurung - "Jujutsu Kaisen (TV)
+   Sub Indo" - jadi isi kurung dibuang lebih dulu supaya kandidat dasarnya
+   "jujutsu-kaisen", bukan "jujutsu-kaisen-tv" yang tidak pernah ada. Bentuk
+   lengkap tetap dicoba setelahnya untuk judul yang memang memakai kurung. */
+function kandidatSlugSamehadaku(title, synonym = "") {
+  const slugs = [];
+  const tambah = (value) => {
+    const teks = String(value || "");
+    if (!teks.trim()) return;
+    const longgar = normalizeTitleKey(teks.replace(/\s*\([^)]*\)\s*/g, " "));
+    const penuh = normalizeTitleKey(teks);
+    for (const dasar of [longgar, penuh]) {
+      const slug = dasar.replace(/\s+/g, "-");
+      if (slug && !slugs.includes(slug)) slugs.push(slug);
+    }
+  };
+  tambah(title);
+  tambah(synonym);
+  return slugs;
+}
+
+/* Kunci judul untuk memverifikasi h1 halaman Samehadaku. Dua bentuk: dengan
+   dan tanpa isi kurung, karena Animasu menambahkan "(TV)" sementara h1
+   Samehadaku tidak. Tanpa bentuk longgar, halaman yang benar ditolak dan
+   unduhan jatuh ke Animasu. */
+function kunciJudulSamehadaku(value) {
+  const teks = String(value || "");
+  if (!teks.trim()) return [];
+  return [...new Set([
+    normalizeTitleKey(teks.replace(/\s*\([^)]*\)\s*/g, " ")),
+    normalizeTitleKey(teks),
+  ].filter(Boolean))];
+}
+
+async function halamanAnimeSamehadaku(title, synonym = "") {
+  const wanted = [...new Set([
+    ...kunciJudulSamehadaku(title),
+    ...kunciJudulSamehadaku(synonym),
+  ])];
+  if (!wanted.length) return null;
+  for (const slug of kandidatSlugSamehadaku(title, synonym)) {
+    try {
+      const halaman = await sourceRequestFor("samehadaku", `/anime/${encodeURIComponent(slug)}/`, {
+        headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      });
+      const sourceUrl = absoluteUrl(`/anime/${encodeURIComponent(slug)}/`, halaman.source.baseUrl);
+      const anime = parseSamehadakuAnime(halaman.result.data, sourceUrl, halaman.source.baseUrl);
+      /* Judul h1 harus cocok. Slug yang salah bisa membalas halaman anime
+         lain (atau soft-404), dan episode/film orang lain tidak boleh
+         dipakai sebagai unduhan anime ini. */
+      if (anime.title && wanted.includes(normalizeTitleKey(anime.title))) return { anime, sourceUrl };
+    } catch (error) {
+      /* 404 = slug ini tidak ada, kandidat berikutnya masih masuk akal.
+         Blokir/timeout = jangan menambah request ke host yang sama. */
+      if (error.notFound) continue;
+      console.error(`Halaman anime Samehadaku gagal untuk "${title}": ${error.message}`);
+      return null;
+    }
+  }
+  try {
+    const search = await sourceRequestFor("samehadaku", "/", {
+      params: { s: wanted[0] }, headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+    });
+    const match = parseSamehadakuSearch(search.result.data, search.source.baseUrl).find((item) => wanted.includes(item.key));
+    if (!match) return null;
+    const page = await sourceRequestFor("samehadaku", new URL(match.sourceUrl).pathname, {
+      headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+    });
+    const anime = parseSamehadakuAnime(page.result.data, match.sourceUrl, page.source.baseUrl);
+    return anime.title ? { anime, sourceUrl: match.sourceUrl } : null;
+  } catch (error) {
+    console.error(`Pencarian Samehadaku gagal untuk "${title}": ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchSamehadakuDownloads(title, synonym = "") {
+  const wanted = [...new Set([normalizeTitleKey(title), normalizeTitleKey(synonym)].filter(Boolean))];
+  if (!wanted.length) return { batches: [], pageUrl: "" };
+  try {
+    const halaman = await halamanAnimeSamehadaku(title, synonym);
+    if (!halaman) return { batches: [], pageUrl: "" };
+    const { anime } = halaman;
+    const batches = [];
+    /* Semua batch diambil (part 1, part 2, ...), bukan hanya yang pertama:
+       masing-masing punya rentang sendiri dan menggabungkannya justru inti
+       dari fallback ini. */
+    for (const target of anime.batchUrls.slice(0, 3)) {
+      try {
+        const batchPage = await sourceRequestFor("samehadaku", new URL(target).pathname, {
+          headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+        });
+        batches.push(...parseSamehadakuDownloads(batchPage.result.data, batchPage.source.baseUrl));
+      } catch (error) {
+        if (error.sourceBlocked) break;
+      }
+    }
+    /* Tidak ada batch (film atau anime ongoing): pakai halaman episode
+       terbaru. Hanya SATU halaman - mengunduh seluruh riwayat episode
+       berarti puluhan request hanya untuk mengisi blok unduhan. */
+    if (!batches.length && anime.downloadPages.length) {
+      const target = anime.downloadPages[0].url;
+      try {
+        const episodePage = await sourceRequestFor("samehadaku", new URL(target).pathname, {
+          headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+        });
+        batches.push(...parseSamehadakuDownloads(episodePage.result.data, episodePage.source.baseUrl));
+      } catch (error) {
+        if (!error.sourceBlocked) console.error(`Unduhan Samehadaku gagal untuk "${title}": ${error.message}`);
+      }
+    }
+    return { batches, pageUrl: batches.length ? anime.batchUrls[0] || anime.downloadPages[0]?.url || "" : "" };
+  } catch (error) {
+    console.error(`Unduhan Samehadaku gagal untuk "${title}": ${error.message}`);
+    return { batches: [], pageUrl: "" };
+  }
+}
+
+/* Simpan HANYA array batch Samehadaku. Hasil kosong adalah kondisi
+   sementara (Cloudflare, rate limit, judul belum ada), jadi cached
+   memperlakukannya sebagai data kosong dan memberi kesempatan lagi setelah
+   EMPTY_CACHE_MS - bukan mengunci pengguna ke tautan Animasu selama 30
+   menit. pageUrl tidak dipakai UI, jadi tidak perlu ikut disimpan. */
+async function batchSamehadakuTersimpan(title, synonym = "") {
+  const key = `downloads:samehadaku:${normalizeTitleKey(title)}`;
+  const batches = await cached(key, async () => {
+    const hasil = await fetchSamehadakuDownloads(title, synonym);
+    return Array.isArray(hasil?.batches) ? hasil.batches : [];
+  }, DETAIL_CACHE_MS, true);
+  return Array.isArray(batches) ? batches : [];
+}
+
+/* Batch dianggap sah kalau punya minimal satu mirror dengan satu tautan. */
+function batchUnduhanSah(batch) {
+  return Boolean(batch && typeof batch === "object" && Array.isArray(batch.mirrors)
+    && batch.mirrors.some((mirror) => Array.isArray(mirror?.links) && mirror.links.length));
+}
+/* Dua sumber unduhan dipakai bersama. Tautan keduanya sering menunjuk berkas
+   yang sama, dan satu sumber bisa mati (kuota Drive habis, Pixeldrain 404)
+   sementara yang lain hidup. Klien menampilkan keduanya sebagai pilihan
+   SETELAH resolusi dipilih, bukan mencampurnya jadi satu daftar buta.
+   `source` ditempel di tiap batch supaya klien tahu asalnya; `fallback`
+   dipertahankan demi bentuk respons lama dan selalu false. */
+function pilihBatchUnduhan(batchesAnimasu = [], batchesSamehadaku = []) {
+  const masu = (Array.isArray(batchesAnimasu) ? batchesAnimasu : [])
+    .filter(batchUnduhanSah)
+    .map((batch) => ({ ...batch, source: "animasu" }));
+  const mega = (Array.isArray(batchesSamehadaku) ? batchesSamehadaku : [])
+    .filter(batchUnduhanSah)
+    .map((batch) => ({ ...batch, source: "samehadaku" }));
+  const batches = [...masu, ...mega];
+  const provider = masu.length && mega.length
+    ? "animasu+samehadaku"
+    : masu.length ? "animasu" : mega.length ? "samehadaku" : "";
+  return { batches, provider, fallback: false };
+}
+
+/* ---------- Sumber ketiga: HiAnime (API hianimes.se, 29 Oktober 2026) ----------
+   hianimetv.su yang dipakai sebelumnya adalah klon WordPress: katalognya
+   terpotong dan mirror-nya harus di-decode dari base64. hianimes.se memakai
+   Next.js dengan API JSON di animehot.cc/api (failover anitv.cfd/api). API
+   itu mengembalikan daftar episode dan `link.sub`/`link.dub` langsung, jadi
+   tidak ada h1 yang perlu dicocokkan dan tidak ada wrapper yang perlu dibuka.
+
+   Pencariannya HANYA bahasa Inggris: "tensei shitara slime datta ken" -> 0,
+   "that time" -> 14. Karena itu judul dicoba dari beberapa alias (sinonim
+   Animasu ikut dipecah), bukan dari satu judul saja.
+
+   Seluruh jalur lama tetap utuh di belakang HIANIME_MODE=html: satu variabel
+   lingkungan, satu baris rollback. */
+function hianimeModeApi() {
+  return String(HIANIME_MODE || "api").toLowerCase() !== "html";
+}
+
+function hianimeApiUrl(pathname) {
+  const base = String(HIANIME_API_BASE_URL || "").replace(/\/+$/, "");
+  const jalur = String(pathname || "").replace(/^\/+/, "");
+  return jalur ? `${base}/${jalur}` : base;
+}
+
+function hianimeJson(data) {
+  if (data && typeof data === "object") return data;
+  if (typeof data !== "string") return null;
+  try { return JSON.parse(data); } catch { return null; }
+}
+
+async function hianimeApiRequest(method, pathname, body) {
+  const options = {
+    method: String(method || "get").toUpperCase(),
+    headers: {
+      ...SOURCE_HEADERS,
+      Accept: "application/json",
+      Origin: HIANIME_SITE_URL,
+      Referer: `${HIANIME_SITE_URL}/`,
+    },
+    timeout: REQUEST_TIMEOUT_MS,
+    validateStatus: SOURCE_ACCEPT_STATUS,
+  };
+  if (body !== undefined) options.data = body;
+  const { result } = await sourceRequestFor("hianimetv", hianimeApiUrl(pathname), options, "hianime");
+  return hianimeJson(result.data);
+}
+
+/* Hasil POST /filter: { total, page, limit, totalPages, results[] }. Yang
+   dipakai hanya identitas anime dan penanda rilis; sisanya dibuang supaya
+   objek yang di-cache tetap kecil. */
+function petakanHasilHianimeApi(payload) {
+  const results = Array.isArray(payload?.results) ? payload.results : [];
+  const hasil = [];
+  const seen = new Set();
+  for (const item of results) {
+    const title = teksAman(item?.title).trim();
+    const slug = teksAman(item?.slug || item?.slugs?.[0]).trim();
+    const id = teksAman(item?._id).trim();
+    if (!title || !slug || !id || seen.has(slug)) continue;
+    seen.add(slug);
+    const skor = [item?.Score, item?.score]
+      .map((nilai) => Number(nilai))
+      .find((nilai) => Number.isFinite(nilai) && nilai > 0 && nilai <= 10) || 0;
+    hasil.push({
+      id,
+      title,
+      slug,
+      malId: Number(item?.mal_id) || 0,
+      type: teksAman(item?.Type).trim(),
+      totalEpisodes: Number(item?.totalEpisodes) || 0,
+      status: teksAman(item?.Status).trim(),
+      image: teksAman(item?.image).trim(),
+      /* `score` di /filter adalah rating umur ("PG-13"), bukan nilai.
+         Nilai sebenarnya ada di `Score` ("8.5"). */
+      score: skor,
+      key: normalizeTitleKey(title),
+      sourceUrl: `${HIANIME_SITE_URL}/watch/${slug}`,
+    });
+  }
+  return hasil;
+}
+
+async function cariHianimeApi(query) {
+  const payload = await hianimeApiRequest("post", "filter", { page: 1, limit: 20, keyword: query });
+  return petakanHasilHianimeApi(payload);
+}
+
+/* Episode dari GET /episodes/{_id}:
+   { episodes: [{ episodeNumber, slug, link: { sub[], dub[] } }] }.
+   Link dipakai langsung sebagai mirror; normalisasiMirror menyaring host
+   shortener dan skema aneh dengan aturan yang sama seperti mirror Animasu. */
+function petakanEpisodeHianimeApi(payload) {
+  const daftar = Array.isArray(payload?.episodes) ? payload.episodes : [];
+  const hasil = [];
+  const seen = new Set();
+  for (const item of daftar) {
+    const number = Number(item?.episodeNumber);
+    const slug = teksAman(item?.slug).trim();
+    if (!Number.isFinite(number) || number <= 0 || !slug || seen.has(number)) continue;
+    seen.add(number);
+    const sub = [...new Set((Array.isArray(item?.link?.sub) ? item.link.sub : []).map(normalisasiMirror).filter(Boolean))];
+    const dub = [...new Set((Array.isArray(item?.link?.dub) ? item.link.dub : []).map(normalisasiMirror).filter(Boolean))];
+    hasil.push({ number, slug, url: `${HIANIME_SITE_URL}/watch/${slug}`, sub, dub });
+  }
+  return hasil.sort((left, right) => left.number - right.number);
+}
+
+function streamsDariEpisodeHianime(episode) {
+  const streams = [];
+  const seen = new Set();
+  const tambah = (url, label) => {
+    const bersih = normalisasiMirror(url);
+    if (!bersih || seen.has(bersih)) return;
+    seen.add(bersih);
+    /* Nama diganti label netral di labelMergedMirrors; field source tetap
+       diisi untuk debugging. */
+    streams.push({ name: `Server ${label}`, url: bersih, source: "hianimetv" });
+  };
+  for (const url of episode?.sub || []) tambah(url, "Sub");
+  for (const url of episode?.dub || []) tambah(url, "Dub");
+  return streams;
+}
+
+/* Peta slug episode HiAnime -> meta yang dibutuhkan pencari mirror. Tanpa
+   ini, route /api/streams/:episodeSlug menebak judul dari slug dan kehilangan
+   tanda baca ("Cyberpunk: Edgerunners 2" menjadi "Cyberpunk Edgerunners 2").
+   Peta hanya di memori; setelah restart, tebakan lama tetap jadi cadangan. */
+const hianimeEpisodeMeta = new Map();
+function ingatMetaEpisodeHianime(slug, meta) {
+  const kunci = teksAman(slug).trim();
+  if (!kunci || !teksAman(meta?.title).trim()) return;
+  hianimeEpisodeMeta.set(kunci, meta);
+  capMap(hianimeEpisodeMeta);
+}
+function metaEpisodeHianimeTersimpan(slug) {
+  return hianimeEpisodeMeta.get(teksAman(slug).trim()) || null;
+}
+
+/* Daftar episode satu anime HiAnime. Rentang penuh diminta sekali kalau
+   totalnya lebih dari 100 - endpoint tanpa parameter hanya memberi halaman
+   pertama (One Piece: total 1180, isi 100). Batas 5000 hanya pengaman kalau
+   upstream mengirim angka yang tidak masuk akal. */
+async function episodeHianimeApiUntuk(anime = {}) {
+  const id = teksAman(anime.id || anime._id).trim();
+  if (!id) return [];
+  const totalEpisodes = Math.min(Math.max(Number(anime.totalEpisodes) || 0, 0), 5000);
+  const jalurEpisode = totalEpisodes > 100
+    ? `episodes/${encodeURIComponent(id)}?start=1&end=${totalEpisodes}`
+    : `episodes/${encodeURIComponent(id)}`;
+  return cached(
+    `hianime:api:episodes:${id}:${totalEpisodes}`,
+    () => hianimeApiRequest("get", jalurEpisode).then(petakanEpisodeHianimeApi),
+    DETAIL_CACHE_MS,
+    true,
+  );
+}
+
+async function resolveHianimeAnimeApi(judul = []) {
+  const queries = [...new Set((judul || [])
+    .flatMap((item) => splitAliases(item))
+    .map((item) => teksAman(item).trim())
+    .filter(Boolean))].slice(0, 4);
+  const wantedKeys = [...new Set(queries.map(normalizeTitleKey).filter(Boolean))];
+  if (!queries.length || !wantedKeys.length) return null;
+  let pilihan = null;
+  for (const query of queries) {
+    try {
+      const hasil = await cariHianimeApi(query);
+      if (!hasil.length) continue;
+      /* Cocok persis menang; kalau tidak ada, penanda musim/film wajib sama
+         dan skor minimal 0.75 - aturan yang sama dengan jalur HTML. */
+      pilihan = hasil.find((item) => wantedKeys.includes(item.key)) || pilihKandidatHianime(hasil, wantedKeys);
+      if (pilihan) break;
+    } catch (error) {
+      /* 404 = query ini tidak ada; alias berikutnya masih masuk akal.
+         Blokir/timeout = berhenti, jangan menambah beban upstream. */
+      if (!error.notFound) return null;
+    }
+  }
+  if (!pilihan) return null;
+  const episodes = await episodeHianimeApiUntuk(pilihan);
+  return { id: pilihan.id, slug: pilihan.slug, malId: pilihan.malId, title: pilihan.title, status: pilihan.status, episodes };
+}
+
+/* Detail dengan bentuk yang SAMA seperti parseAnimeDetail(), supaya klien
+   tidak perlu tahu sumbernya. Field yang tidak dimiliki API dibiarkan
+   "Unknown"; nilai palsu lebih berbahaya daripada nilai kosong. */
+function detailDariAnimeHianime(anime = {}, episodes = []) {
+  const judul = teksAman(anime.title).trim();
+  const slug = teksAman(anime.slug || anime.slugs?.[0]).trim();
+  const skor = Number(anime.Score ?? anime.score);
+  const daftarEpisode = (Array.isArray(episodes) ? episodes : []).map((episode) => ({
+    episode: `Episode ${episode.number}`,
+    slug: episode.slug,
+    sourceUrl: episode.url || `${HIANIME_SITE_URL}/watch/${episode.slug}`,
+    sourceProvider: "hianimetv",
+  }));
+  for (const episode of daftarEpisode) {
+    ingatMetaEpisodeHianime(episode.slug, {
+      title: judul,
+      synonym: teksAman(anime.alternateTitle).trim(),
+      animeSlug: slug,
+      episodeNumber: episodeNumber(episode.episode, 1),
+      dariHianime: true,
+    });
+  }
+  return {
+    slug,
+    title: judul,
+    synonym: teksAman(anime.alternateTitle || anime.English).trim(),
+    englishTitle: teksAman(anime.English).trim(),
+    synopsis: teksAman(anime.synopsis).trim(),
+    image: teksAman(anime.image).trim(),
+    rating: Number.isFinite(skor) && skor > 0 && skor <= 10 ? skor : 0,
+    genres: (Array.isArray(anime.genres) ? anime.genres : [])
+      .filter((genre) => typeof genre === "string" && genre.trim())
+      .map((genre) => ({ name: genre.trim(), slug: normalizeTitleKey(genre) })),
+    status: teksAman(anime.Status).trim(),
+    aired: teksAman(anime.Aired).trim(),
+    type: teksAman(anime.Type).trim() || "Unknown",
+    episode: Number(anime.totalEpisodes) > 0 ? String(Number(anime.totalEpisodes)) : "Unknown",
+    duration: teksAman(anime.Duration).trim() || "Unknown",
+    studio: "Unknown",
+    season: teksAman(anime.Premiered).trim() || "Unknown",
+    trailer: "",
+    updateAt: "",
+    totalEpisodes: Number(anime.totalEpisodes) || daftarEpisode.length,
+    malId: Number(anime.mal_id) || 0,
+    episodes: daftarEpisode,
+    batches: [],
+    sourceProvider: "hianimetv",
+    sourceUrl: `${HIANIME_SITE_URL}/watch/${slug}`,
+  };
+}
+
+/* GET /anime/{slug} menjawab { anime } tanpa daftar episode lengkap. Kalau
+   slug tidak dikenali (tautan lama, slug Animasu yang kebetulan dicoba),
+   cari lewat kata kunci dan wajibkan slug atau judul yang sama persis -
+   jangan menampilkan anime lain hanya karena kata pertamanya mirip. */
+async function fetchHianimeDetail(slug) {
+  const bersih = teksAman(slug).trim();
+  if (!bersih) throw new Error("Slug HiAnime kosong.");
+  let anime = null;
+  let galatPertama = null;
+  try {
+    const payload = await hianimeApiRequest("get", `anime/${encodeURIComponent(bersih)}`);
+    anime = payload?.anime || null;
+  } catch (error) {
+    if (!error.notFound) throw error;
+    galatPertama = error;
+  }
+  if (!anime) {
+    const query = bersih.replace(/[-:_]+/g, " ").replace(/\s+/g, " ").trim();
+    let hasil;
+    try {
+      hasil = await cariHianimeApi(query);
+    } catch (error) {
+      if (!error.notFound) throw error;
+      hasil = [];
+    }
+    const cocok = hasil.find((item) => item.slug === bersih) || hasil.find((item) => item.key === normalizeTitleKey(query));
+    if (!cocok) {
+      throw galatPertama || Object.assign(new Error(`HiAnime tidak punya anime dengan slug "${bersih}".`), { notFound: true });
+    }
+    const payload = await hianimeApiRequest("get", `anime/${encodeURIComponent(cocok.slug)}`);
+    anime = payload?.anime || null;
+  }
+  if (!anime?.title) throw Object.assign(new Error("HiAnime detail tidak berisi judul anime."), { notFound: true });
+  const episodes = await episodeHianimeApiUntuk(anime);
+  return detailDariAnimeHianime(anime, episodes);
+}
+
+/* Animasu tetap sumber utama. HiAnime hanya dicoba kalau Animasu tidak punya
+   slug itu - yaitu kartu yang berasal dari katalog HiAnime. Kalau HiAnime
+   juga 404, error Animasu yang dilaporkan supaya pesan lama tidak berubah. */
+async function fetchDetailDenganCadangan(slug) {
+  const kunciAnimasu = `detail:animasu:${slug}`;
+  try {
+    const detail = await cached(kunciAnimasu, () => fetchAnimeDetail(slug), DETAIL_CACHE_MS, true);
+    return { detail, provider: "animasu", cacheKey: kunciAnimasu };
+  } catch (error) {
+    if (!hianimeModeApi()) throw error;
+    const kunciHianime = `detail:hianimetv:${slug}`;
+    try {
+      const detail = await cached(kunciHianime, () => fetchHianimeDetail(slug), DETAIL_CACHE_MS, true);
+      return { detail, provider: "hianimetv", cacheKey: kunciHianime };
+    } catch (hianimeError) {
+      if (!hianimeError.notFound) {
+        console.error(`Cadangan HiAnime gagal untuk "${slug}": ${hianimeError.message}`);
+        throw hianimeError;
+      }
+      throw error;
+    }
+  }
+}
+
+/* Kartu katalog dengan bentuk yang sama seperti kartu Animasu; tanpa ini
+   normAnime() di klien menampilkan judul tanpa poster dan "? Eps". */
+function kartuDariHasilHianime(item = {}) {
+  const status = statusOngoing(item.status)
+    ? "ONGOING"
+    : /not yet|upcoming|segera|belum tayang/i.test(String(item.status || "")) ? "UPCOMING" : "COMPLETE";
+  return {
+    title: teksAman(item.title).trim(),
+    slug: teksAman(item.slug).trim(),
+    image: teksAman(item.image).trim(),
+    posterUrl: teksAman(item.image).trim(),
+    type: teksAman(item.type).trim() || "Unknown",
+    episode: Number(item.totalEpisodes) > 0 ? `${Number(item.totalEpisodes)} Eps` : "",
+    status,
+    totalEpisodes: Number(item.totalEpisodes) || 0,
+    rating: Number(item.score) > 0 ? Number(item.score) : 0,
+    malId: Number(item.malId) || 0,
+    sourceProvider: "hianimetv",
+    sourceUrl: item.sourceUrl || `${HIANIME_SITE_URL}/watch/${item.slug}`,
+  };
+}
+
+async function cariKatalogHianime(query) {
+  const teks = teksAman(query).trim();
+  if (!teks || !hianimeModeApi()) return [];
+  const hasil = await cariHianimeApi(teks);
+  return hasil.map(kartuDariHasilHianime).filter((kartu) => kartu.title && kartu.slug);
+}
+
+/* Animasu yang menang untuk judul yang sama: kartunya sudah punya slug yang
+   dikenal route detail. Perbandingan memakai semua alias, bukan cuma title -
+   "Demon Lord 2099" dan "Maou 2099" adalah anime yang sama. */
+function gabungKartuKatalog(...daftar) {
+  const hasil = [];
+  const terpakai = new Set();
+  for (const kartu of daftar.flat()) {
+    if (!kartu?.slug || !normalizeTitleKey(kartu.title)) continue;
+    const kunciJudul = [...new Set([kartu.title, kartu.englishTitle, ...(Array.isArray(kartu.aliases) ? kartu.aliases : [])]
+      .map((nilai) => normalizeTitleKey(nilai))
+      .filter(Boolean))];
+    if (terpakai.has(`slug:${kartu.slug}`) || kunciJudul.some((kunci) => terpakai.has(`judul:${kunci}`))) continue;
+    hasil.push(kartu);
+    terpakai.add(`slug:${kartu.slug}`);
+    for (const kunci of kunciJudul) terpakai.add(`judul:${kunci}`);
+  }
+  return hasil;
+}
+
+async function fetchHianimeEpisodes(animeSlug = "", title = "", synonym = "") {
+  if (!hianimeModeApi()) return fetchHianimeEpisodesHtml(animeSlug, title, synonym);
+  if (!teksAman(title).trim() && !teksAman(synonym).trim()) return { title: "", key: "", episodes: [] };
+  try {
+    const anime = await resolveHianimeAnimeApi([title, synonym]);
+    if (!anime?.episodes?.length) return { title: "", key: "", episodes: [] };
+    return {
+      title: anime.title,
+      key: normalizeTitleKey(anime.title),
+      /* Status API berbahasa Inggris ("Currently Airing"/"Finished Airing")
+         dan sudah dikenali statusOngoing. */
+      status: anime.status,
+      episodes: anime.episodes.map((episode) => ({
+        /* Sengaja hanya nomor: normalizeEpisodes membaca angka dari field ini
+           dan judul yang mengandung angka lain (mis. "Edgerunners 2") bisa
+           membuat nomor episode salah. */
+        episode: `Episode ${episode.number}`,
+        slug: episode.slug,
+        sourceUrl: episode.url,
+        sourceProvider: "hianimetv",
+      })),
+    };
+  } catch (error) {
+    console.error(`Suplemen HiAnime gagal untuk "${title}": ${error.message}`);
+    return { title: "", key: "", episodes: [] };
+  }
+}
+
+async function hianimeMirrorUntukEpisode(meta) {
+  if (!hianimeModeApi()) return hianimeMirrorUntukEpisodeHtml(meta);
+  /* Sama seperti jalur HTML: judul dari slug masih cukup kalau meta episode
+     Animasu tidak terbaca. */
+  if (!meta?.animeSlug && !teksAman(meta?.title).trim()) return [];
+  /* Meta yang dicatat dari detail HiAnime sudah membawa judul aslinya.
+     Membaca halaman Animasu untuk slug HiAnime hanya menghasilkan 404. */
+  const detail = meta.animeSlug && !meta.dariHianime
+    ? await cached(`detail:animasu:${meta.animeSlug}`, () => fetchAnimeDetail(meta.animeSlug), DETAIL_CACHE_MS, true).catch(() => null)
+    : null;
+  const lengkap = titleAliasRecord(detail || { title: meta.title, synonym: meta.synonym || "", slug: meta.animeSlug || "" });
+  const judul = [lengkap.englishTitle, lengkap.synonym, lengkap.title, ...(lengkap.aliases || []), meta.title].filter(Boolean);
+  const kunci = normalizeTitleKey(lengkap.title || meta.title || meta.animeSlug);
+  const anime = await cached(`hianime:anime:${kunci}`, () => resolveHianimeAnimeApi(judul), DETAIL_CACHE_MS, true).catch(() => null);
+  if (!anime?.id) return [];
+  const nomor = Number(meta.episodeNumber);
+  const streams = await cached(`hianime:mirror:${anime.slug}:${nomor}`, () => {
+    const episode = (anime.episodes || []).find((item) => item.number === nomor);
+    return Promise.resolve(episode ? streamsDariEpisodeHianime(episode) : []);
+  }, STREAM_CACHE_MS, true).catch(() => []);
+  return Array.isArray(streams) ? streams : [];
+}
+
+/* ---------- Sumber ketiga: HiAnime (hianimetv.su) — jalur HTML lama ----------
+   Sumber ketiga yang mengisi episode yang belum ada di Animasu.
+   Tidak menggantikan Animasu, hanya melengkapi nomor episode yang hilang.
+   Dipertahankan utuh supaya HIANIME_MODE=html benar-benar bisa dipakai
+   tanpa mengubah kode lain. */
+async function fetchHianimeEpisodesHtml(animeSlug = "", title = "", synonym = "") {
+  const kandidat = [...new Set([String(animeSlug || "").trim(), slugifyTitle(synonym), slugifyTitle(title)].filter(Boolean))].slice(0, 3);
+  if (!kandidat.length) return { title: "", key: "", episodes: [] };
+  const wanted = [...new Set([normalizeTitleKey(title), normalizeTitleKey(synonym)].filter(Boolean))];
+  let lastError = null;
+  for (const slug of kandidat) {
+    try {
+      const { result } = await sourceRequestFor("hianimetv", `/${encodeURIComponent(slug)}/`, {
+        headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      });
+      const $ = cheerio.load(htmlAman(result.data));
+      const pageTitle = $("h1").first().text().replace(/\s+/g, " ").trim();
+      const pageKey = normalizeTitleKey(pageTitle);
+      /* Judul tidak cocok = slug menunjuk anime lain. Jangan tambahkan
+         episode yang bukan milik judul ini hanya karena slugnya mirip. */
+      if (pageKey && wanted.length && !wanted.some((key) => pageKey === key || pageKey.includes(key) || key.includes(pageKey))) continue;
+      const episodes = [];
+      const seen = new Set();
+      /* HiAnime memakai slug seperti anime-title-episode-44-english-subbed/
+         (dengan hubung di sekitar "episode", bukan garis miring). Selector
+         harus mencocak "-episode-" bukan "/episode/". */
+      $("a[href*='-episode-']").each((_, element) => {
+        const anchor = $(element);
+        const href = anchor.attr("href") || "";
+        if (!/-episode-\d+/.test(href)) return;
+        if (/-batch\/?$/.test(href.split(/[?#]/)[0])) return;
+        const url = absoluteUrl(href, HIANIME_BASE_URL);
+        if (seen.has(url)) return;
+        seen.add(url);
+        const episodeSlug = pathSlugOf(url);
+        if (!episodeSlug) return;
+        /* Hanya terima episode yang milik anime yang dicari (slug episode
+           harus dimulai dengan slug anime). Mencegah saran anime lain di
+           sidebar Halaman HiAnime ikut masuk sebagai episode. */
+        if (!episodeSlug.startsWith(slug)) return;
+        const fromSlug = /-episode-(\d+)/.exec(episodeSlug);
+        const label = (anchor.attr("title") || anchor.find("img").first().attr("alt") || anchor.text() || "").replace(/\s+/g, " ").trim();
+        episodes.push({ episode: label || `Episode ${fromSlug ? fromSlug[1] : episodes.length + 1}`, slug: episodeSlug, sourceUrl: url, sourceProvider: "hianimetv" });
+      });
+      if (episodes.length) {
+        /* Status hanya dipakai sebagai penegur, bukan penentu. Kalau markup
+           tidak memberi status, biarkan kosong (tidak diketahui) supaya
+           tidak memaksa anime ongoing Animasu terlihat tamat. */
+        const status = $(".spe span").filter((_, element) => /^status\s*:/i.test($(element).text())).first().text().split(":").slice(1).join(":").trim();
+        return { title: pageTitle, key: pageKey, episodes, status };
+      }
+    } catch (error) {
+      lastError = error;
+      /* 404 = slug ini tidak ada; kandidat berikutnya masih masuk akal.
+         Timeout/blokir = jangan menembak kandidat lain, itu hanya menambah
+         beban upstream. */
+      if (!error.notFound) break;
+    }
+  }
+  if (lastError) console.error(`Suplemen HiAnime gagal untuk "${title}": ${lastError.message}`);
+  return { title: "", key: "", episodes: [] };
+}
+
+/* ---------- Mirror HiAnime (pelengkap, bukan pengganti) ----------
+   Animasu tetap sumber utama. Beberapa mirror bawaannya mati, sementara
+   halaman episode HiAnime menyimpan mirror yang bisa diputar. Yang perlu
+   diselesaikan bukan "ambil halaman HiAnime", tapi PEMETAAN: episode
+   Animasu bernama "nonton-judul-episode-24", sedangkan HiAnime memakai
+   judul Inggris dan slug yang sama sekali lain.
+
+   Urutan pemetaan:
+     1. Baca halaman episode Animasu yang sudah diunduh untuk mirror:
+        h1 memberi nomor episode, tautan /anime/ memberi slug anime.
+     2. Ambil detail Animasu dari cache (kunci yang sama dengan route
+        detail) untuk mendapatkan judul, sinonim, dan judul Inggris.
+     3. Coba slug HiAnime dari tiap judul. Halaman yang tidak ada tetap
+        membalas 200 dengan h1 situs ("HiAnime - Watch your favourite..."),
+        jadi h1 WAJIB cocok - kalau tidak, halaman itu bukan anime kita.
+     4. Kalau slug tidak ada, cari lewat /?s= dan hanya baca kartu hasil
+        (.listupd .bsx), bukan sidebar Popular Anime.
+     5. Buka halaman episode HiAnime, decode tombol server (base64 berisi
+        iframe), lalu saring lewat normalisasiMirror yang sama dengan
+        mirror Animasu. */
+function parseAnimasuEpisodeMeta(html, episodeSlug = "") {
+  const $ = cheerio.load(htmlAman(html));
+  const heading = $("h1").first().text().replace(/\s+/g, " ").trim();
+  const animeHref = $("a[href*='/anime/']").first().attr("href") || "";
+  let animeSlug = "";
+  try {
+    const segments = new URL(absoluteUrl(animeHref)).pathname.split("/").filter(Boolean);
+    animeSlug = segments[0] === "anime" ? segments[1] || "" : "";
+  } catch { animeSlug = ""; }
+  const nomor = /(?:episode|eps?)\s*(\d+(?:[.,]\d+)?)/i.exec(heading)
+    || /-episode-(\d+(?:[.,]\d+)?)/i.exec(teksAman(episodeSlug));
+  const angka = nomor ? Number(String(nomor[1]).replace(",", ".")) : 1;
+  const title = heading
+    .replace(/^nonton\s+/i, "")
+    .replace(/\s+episode\s+\d+(?:[.,]\d+)?.*$/i, "")
+    .replace(/\s+sub\s*indo\s*$/i, "")
+    .trim();
+  return { title, animeSlug, episodeNumber: Number.isFinite(angka) && angka > 0 ? angka : 1, heading };
+}
+
+/* Kartu hasil pencarian HiAnime ada di .listupd .bsx. Sidebar "Popular
+   Anime" memakai .leftseries dan sengaja tidak dibaca: kalau ikut, hampir
+   semua query "cocok" ke anime yang sedang populer, bukan yang dicari. */
+function parseHianimeSearch(html, baseUrl = HIANIME_BASE_URL) {
+  const $ = cheerio.load(htmlAman(html));
+  const results = [];
+  $(".listupd .bsx a[href*='/anime/']").each((_, element) => {
+    const anchor = $(element);
+    const sourceUrl = absoluteUrl(anchor.attr("href") || "", baseUrl);
+    const title = (anchor.attr("title") || anchor.find("h2").first().text() || anchor.text() || "").replace(/\s+/g, " ").trim();
+    const match = /\/anime\/([^/]+)/.exec((() => { try { return new URL(sourceUrl).pathname; } catch { return ""; } })());
+    const slug = match ? match[1] : "";
+    if (!title || !slug || results.some((item) => item.slug === slug)) return;
+    results.push({ title, slug, key: normalizeTitleKey(title), sourceUrl });
+  });
+  return results;
+}
+
+function judulHianimeCocok(pageTitle, wantedKeys = []) {
+  const key = normalizeTitleKey(pageTitle);
+  return Boolean(key) && wantedKeys.includes(key);
+}
+
+/* Penanda rilis (season/part/film) harus sama. Tanpa ini, judul
+   "Slime Season 2" dan "Slime Season 4" berbagi 9 dari 10 token dan
+   skor 0.9 - di atas ambang - padahal musimnya beda. */
+function penandaRilisJudul(value) {
+  const teks = normalizeTitleKey(value);
+  const season = /\bseason\s*(\d+)\b/.exec(teks);
+  const part = /\bpart\s*(\d+)\b/.exec(teks);
+  return `${season ? season[1] : ""}|${part ? part[1] : ""}|${/\bmovie\b/.test(teks) ? "movie" : ""}`;
+}
+
+function pilihKandidatHianime(results = [], wantedKeys = []) {
+  let best = null;
+  let bestScore = 0;
+  for (const item of results) {
+    const key = normalizeTitleKey(item.title);
+    if (!key) continue;
+    if (wantedKeys.includes(key)) return item;
+    for (const wanted of wantedKeys) {
+      if (penandaRilisJudul(wanted) !== penandaRilisJudul(item.title)) continue;
+      const score = titleMatchScore(wanted, item.title);
+      if (score > bestScore) { best = item; bestScore = score; }
+    }
+  }
+  /* 0.75 = minimal tiga per empat token judul pendek harus sama. Ambang
+     rendah membuat "Slime Season 2" cocok ke "Slime Season 4" hanya karena
+     kata "slime". */
+  return bestScore >= 0.75 ? best : null;
+}
+
+function parseHianimeEpisodeLinks(html, animeSlug, baseUrl = HIANIME_BASE_URL) {
+  const $ = cheerio.load(htmlAman(html));
+  const episodes = [];
+  const seen = new Set();
+  if (!animeSlug) return episodes;
+  $("a[href]").each((_, element) => {
+    const url = absoluteUrl($(element).attr("href") || "", baseUrl);
+    let pathname = "";
+    try { pathname = new URL(url).pathname; } catch { return; }
+    const segments = pathname.split("/").filter(Boolean);
+    if (segments.length !== 1) return;
+    const slug = segments[0];
+    if (!slug.startsWith(`${animeSlug}-`) || slug.endsWith("-batch")) return;
+    if (seen.has(slug)) return;
+    seen.add(slug);
+    const match = /-episode-(\d+(?:-\d+)?)/.exec(slug);
+    const number = match ? Number(match[1].replace("-", ".")) : 1;
+    if (!Number.isFinite(number) || number <= 0) return;
+    episodes.push({ number, slug, url: absoluteUrl(`/${slug}/`, baseUrl), englishSubbed: /-english-subbed$/.test(slug) });
+  });
+  return episodes;
+}
+
+function decodeHianimeServers(html, baseUrl = HIANIME_BASE_URL) {
+  const $ = cheerio.load(htmlAman(html));
+  const streams = [];
+  const seen = new Set();
+  $(".server-button").each((_, element) => {
+    const onclick = $(element).attr("onclick") || "";
+    const encoded = /value:\s*'([^']+)'/.exec(onclick)?.[1] || "";
+    if (!encoded) return;
+    let decoded = "";
+    try { decoded = Buffer.from(encoded, "base64").toString("utf8"); } catch { return; }
+    if (!/<iframe/i.test(decoded)) return;
+    const $frame = cheerio.load(decoded);
+    const src = ($frame("iframe").first().attr("src") || "").replace(/&amp;/g, "&");
+    const url = normalisasiMirror(absoluteUrl(src, baseUrl));
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    const label = $(element).text().replace(/\s+/g, " ").trim();
+    /* Nama sengaja netral ("Server Fast"), bukan "HiAnime": badge sumber
+       tidak ditampilkan di UI. Field source tetap diisi untuk debugging. */
+    streams.push({ name: label ? `Server ${label}` : `Server ${streams.length + 1}`, url, source: "hianimetv" });
+  });
+  return streams;
+}
+
+/* Wrapper player hianimetv.su TIDAK bisa dipasang langsung di iframe
+   aplikasi: halaman itu memeriksa Referer dan membalas "Access denied. Your
+   domain is not allowed." untuk domain lain. Yang bisa diputar adalah iframe
+   DI DALAMNYA (biasanya megaplay.su), jadi wrapper dibuka sekali di server
+   dengan Referer situs asalnya, lalu URL dalamnya yang dikirim ke klien. */
+const HIANIME_PLAYER_PATH = /(?:^|\/)player\/?$/i;
+
+function hianimeWrapper(url) {
+  let parsed;
+  let base;
+  try {
+    parsed = new URL(String(url || ""));
+    base = new URL(HIANIME_BASE_URL);
+  } catch {
+    return null;
+  }
+  if (parsed.origin !== base.origin) return null;
+  if (!HIANIME_PLAYER_PATH.test(parsed.pathname)) return null;
+  return parsed;
+}
+
+function iframeHianimePertama(html, halamanUrl = HIANIME_BASE_URL) {
+  const teks = htmlAman(html);
+  /* Penolakan domain tetap HTTP 200 dan tidak punya iframe. Pesannya tidak
+     boleh dianggap halaman player yang sah. */
+  if (!teks.trim() || /access denied/i.test(teks)) return "";
+  const $ = cheerio.load(teks);
+  const src = ($("iframe[src]").first().attr("src") || "").replace(/&amp;/g, "&").trim();
+  if (!src) return "";
+  const url = normalisasiMirror(absoluteUrl(src, halamanUrl || HIANIME_BASE_URL));
+  if (!url) return "";
+  /* Iframe yang isinya wrapper lagi tidak akan pernah bisa diputar. */
+  return hianimeWrapper(url) ? "" : url;
+}
+
+async function bukaHianimeEmbed(url) {
+  const target = normalisasiMirror(url);
+  if (!target) return "";
+  const parsed = hianimeWrapper(target);
+  if (!parsed) return target;
+  try {
+    const { result } = await sourceRequestFor("hianimetv", `${parsed.pathname}${parsed.search}`, {
+      headers: { ...SOURCE_HEADERS, Referer: `${new URL(HIANIME_BASE_URL).origin}/` },
+      timeout: Math.min(REQUEST_TIMEOUT_MS, 5000),
+      validateStatus: SOURCE_ACCEPT_STATUS,
+    });
+    return iframeHianimePertama(result.data, target);
+  } catch {
+    /* Satu wrapper gagal dibuka bukan alasan menjatuhkan mirror lain. */
+    return "";
+  }
+}
+
+async function bukaSemuaHianimeEmbed(streams) {
+  const terbuka = await Promise.all((streams || []).map(async (stream) => {
+    const url = await bukaHianimeEmbed(stream?.url);
+    return url ? { ...stream, url } : null;
+  }));
+  const hasil = [];
+  const seen = new Set();
+  for (const stream of terbuka) {
+    if (!stream || seen.has(stream.url)) continue;
+    seen.add(stream.url);
+    hasil.push(stream);
+  }
+  return hasil;
+}
+
+async function resolveHianimeAnime(judul = []) {
+  const aliases = [...new Set((judul || []).map((item) => teksAman(item).trim()).filter(Boolean))].slice(0, 5);
+  const wantedKeys = [...new Set(aliases.map(normalizeTitleKey).filter(Boolean))];
+  if (!wantedKeys.length) return null;
+  const slugs = [...new Set(aliases.map(slugifyTitle).filter(Boolean))].slice(0, 4);
+  let blocked = false;
+  for (const slug of slugs) {
+    try {
+      const { result } = await sourceRequestFor("hianimetv", `/anime/${encodeURIComponent(slug)}/`, {
+        headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      }, "hianime");
+      const $ = cheerio.load(htmlAman(result.data));
+      const pageTitle = $("h1").first().text().replace(/\s+/g, " ").trim();
+      /* Daftar episode ikut dikembalikan (bukan HTML-nya) supaya
+         hianimeMirrorDariHalaman tidak perlu membuka halaman anime yang
+         sama sekali lagi. */
+      if (judulHianimeCocok(pageTitle, wantedKeys)) {
+        return { slug, title: pageTitle, episodes: parseHianimeEpisodeLinks(result.data, slug) };
+      }
+    } catch (error) {
+      /* 404 = slug ini tidak ada, kandidat berikutnya masih masuk akal.
+         Blokir/timeout = berhenti, jangan menembak kandidat lain. */
+      if (!error.notFound) { blocked = true; break; }
+    }
+  }
+  if (blocked) return null;
+  for (const query of aliases.slice(0, 2)) {
+    try {
+      const { result } = await sourceRequestFor("hianimetv", "/", {
+        params: { s: query }, headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      }, "hianime");
+      const found = pilihKandidatHianime(parseHianimeSearch(result.data), wantedKeys);
+      if (!found) continue;
+      const halaman = await sourceRequestFor("hianimetv", `/anime/${encodeURIComponent(found.slug)}/`, {
+        headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      }, "hianime");
+      const $ = cheerio.load(htmlAman(halaman.result.data));
+      const pageTitle = $("h1").first().text().replace(/\s+/g, " ").trim();
+      if (judulHianimeCocok(pageTitle, wantedKeys)) return { slug: found.slug, title: pageTitle };
+    } catch (error) {
+      if (!error.notFound) return null;
+    }
+  }
+  return null;
+}
+
+async function hianimeMirrorDariHalaman(animeSlug, number, daftarAwal = null) {
+  /* Daftar episode di halaman anime dibaca LEBIH DULU. Menebak URL
+     "/<slug>-episode-N-english-subbed/" memang satu request kalau tepat,
+     tetapi kalau meleset ia memakan dua request tambahan - sementara lane
+     HiAnime hanya boleh satu request per 1,5 detik, sehingga timeout 9 detik
+     habis sebelum episode ditemukan. Kalau resolveHianimeAnime sudah membaca
+     halaman anime, daftarnya dipakai langsung: satu request lebih hemat. */
+  try {
+    let daftar = Array.isArray(daftarAwal) && daftarAwal.length ? daftarAwal : null;
+    if (!daftar) {
+      const { result } = await sourceRequestFor("hianimetv", `/anime/${encodeURIComponent(animeSlug)}/`, {
+        headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      }, "hianime");
+      daftar = parseHianimeEpisodeLinks(result.data, animeSlug);
+    }
+    const pilihan = daftar.filter((item) => item.number === number);
+    const episode = pilihan.find((item) => item.englishSubbed) || pilihan[0] || (number === 1 ? daftar[0] : null);
+    if (episode) {
+      const halaman = await sourceRequestFor("hianimetv", `/${episode.slug}/`, {
+        headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      }, "hianime");
+      const streams = await bukaSemuaHianimeEmbed(decodeHianimeServers(halaman.result.data));
+      if (streams.length) return streams;
+    }
+  } catch { /* jatuh ke tebakan URL di bawah */ }
+  /* Cadangan untuk halaman yang daftar episodenya tidak terbaca: tebak dua
+     bentuk URL yang paling umum. */
+  const nomor = String(number).replace(".", "-");
+  for (const pathname of [`/${animeSlug}-episode-${nomor}-english-subbed/`, `/${animeSlug}-episode-${nomor}/`]) {
+    try {
+      const { result } = await sourceRequestFor("hianimetv", pathname, {
+        headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      }, "hianime");
+      const streams = await bukaSemuaHianimeEmbed(decodeHianimeServers(result.data));
+      if (streams.length) return streams;
+    } catch (error) {
+      if (!error.notFound) return [];
+    }
+  }
+  return [];
+}
+
+async function hianimeMirrorUntukEpisodeHtml(meta) {
+  /* HiAnime tidak boleh bergantung pada halaman Animasu yang berhasil
+     diparse: kalau meta episode kosong, judul dari slug masih cukup untuk
+     mencari anime yang sama di HiAnime. */
+  if (!meta?.animeSlug && !teksAman(meta?.title).trim()) return [];
+  const detail = meta.animeSlug
+    ? await cached(`detail:animasu:${meta.animeSlug}`, () => fetchAnimeDetail(meta.animeSlug), DETAIL_CACHE_MS, true).catch(() => null)
+    : null;
+  const lengkap = titleAliasRecord(detail || { title: meta.title, synonym: meta.synonym || "", slug: meta.animeSlug || "" });
+  const judul = [lengkap.englishTitle, lengkap.synonym, lengkap.title, ...(lengkap.aliases || []), meta.title].filter(Boolean);
+  const kunci = normalizeTitleKey(lengkap.title || meta.title || meta.animeSlug);
+  const anime = await cached(`hianime:anime:${kunci}`, () => resolveHianimeAnime(judul), DETAIL_CACHE_MS, true).catch(() => null);
+  if (!anime?.slug) return [];
+  const streams = await cached(`hianime:mirror:${anime.slug}:${meta.episodeNumber}`, () => hianimeMirrorDariHalaman(anime.slug, meta.episodeNumber, anime.episodes), STREAM_CACHE_MS, true).catch(() => []);
+  return Array.isArray(streams) ? streams : [];
+}
+
+/* Samehadaku TIDAK memakai <select> mirror seperti Animasu: setiap server
+   adalah .east_player_option dengan atribut data-embed berisi potongan
+   iframe (di-escape di HTML). Parser HTML sudah mendekode atribut itu, jadi
+   sumbernya tinggal diambil dari src. Tema lama yang tidak punya data-embed
+   tetap tertangkap lewat #pembed. */
+function parseSamehadakuMirrors(html) {
+  const $ = cheerio.load(htmlAman(html));
+  const streams = [];
+  const seen = new Set();
+  const tambah = (name, raw) => {
+    const url = normalisasiMirror(decodeMirror(raw));
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    streams.push({ name: teksAman(name).replace(/\s+/g, " ").trim() || `Mirror ${streams.length + 1}`, url, source: "samehadaku" });
+  };
+  $(".east_player_option[data-embed]").each((_, element) => {
+    const embed = $(element).attr("data-embed") || "";
+    const src = (embed.match(/<iframe[^>]+src=["']([^"']+)["']/i) || [])[1] || "";
+    tambah($(element).find("span").first().text(), src);
+  });
+  if (!streams.length) $("#pembed iframe[src]").each((_, element) => tambah("Samehadaku", $(element).attr("src")));
+  return streams;
+}
+
+function nomorEpisodeDariSlug(slug) {
+  const nomor = /-episode-(\d+(?:[.-]\d+)?)/i.exec(teksAman(slug));
+  return nomor ? Number(nomor[1].replace("-", ".")) : 0;
+}
+
+/* Judul cadangan kalau halaman episode Animasu tidak bisa diparse. Slug
+   "nonton-tank-chair-episode-3" cukup untuk mencari "Tank Chair" di
+   Samehadaku/HiAnime. */
+function metaEpisodeDariSlug(episodeSlug) {
+  const teks = teksAman(episodeSlug).replace(/^nonton-/, "");
+  const nomor = nomorEpisodeDariSlug(teks);
+  const judul = teks.replace(/-episode-[\d.-]+.*$/i, "").replace(/-/g, " ").trim();
+  return {
+    title: judul.replace(/\b\w/g, (huruf) => huruf.toUpperCase()),
+    synonym: "",
+    animeSlug: "",
+    episodeNumber: nomor > 0 ? nomor : 1,
+  };
+}
+
+/* Mirror Samehadaku untuk satu nomor episode. Halaman anime di-cache per
+   judul (satu request), halaman episode di-cache per judul+nomor. Dua
+   request berurutan ini berjalan di dalam batas waktu yang sama dengan
+   HiAnime, jadi route tidak menunggu dua kali lipat. */
+async function samehadakuMirrorUntukEpisode(meta) {
+  const judul = teksAman(meta?.title).trim();
+  const nomor = Number(meta?.episodeNumber);
+  if (!judul || !Number.isFinite(nomor) || nomor <= 0) return [];
+  const kunci = normalizeTitleKey(judul);
+  const streams = await cached(`samehadaku:mirror:${kunci}:${nomor}`, async () => {
+    const baca = async (pathname) => {
+      const page = await sourceRequestFor("samehadaku", pathname, {
+        headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS,
+      }, "samehadaku");
+      return parseSamehadakuMirrors(page.result.data);
+    };
+    /* Jalur cepat: URL episode Samehadaku berbentuk /<slug>-episode-<N>/ di
+       root. Satu request, tanpa membaca halaman anime lebih dulu - penting
+       karena lane upstream hanya boleh satu request per 1,5 detik. Kalau
+       tidak ada (film, penomoran khusus), baru cari lewat halaman anime. */
+    const slug = kandidatSlugSamehadaku(judul)[0];
+    if (slug && Number.isInteger(nomor)) {
+      for (const kandidat of [`/${slug}-episode-${nomor}/`, `/${slug}-episode-${nomor}-end/`]) {
+        try {
+          const hasil = await baca(kandidat);
+          if (hasil.length) return hasil;
+        } catch (error) {
+          if (!error.notFound) break;
+        }
+      }
+    }
+    const halaman = await cached(
+      `samehadaku:anime:${kunci}`,
+      () => halamanAnimeSamehadaku(judul, meta?.synonym || ""),
+      DETAIL_CACHE_MS,
+      true,
+    ).catch(() => null);
+    const anime = halaman?.anime;
+    if (!anime) return [];
+    const halamanEpisode = (anime.downloadPages || []).find((item) => Number(item.number) === nomor);
+    const dariDaftar = (anime.episodes || []).find((item) => nomorEpisodeDariSlug(item.slug) === nomor);
+    const target = halamanEpisode?.url || dariDaftar?.sourceUrl || "";
+    if (!target) return [];
+    try {
+      return await baca(new URL(target).pathname);
+    } catch (error) {
+      if (!error.sourceBlocked) console.error(`Mirror Samehadaku gagal untuk "${judul}" ep ${nomor}: ${error.message}`);
+      return [];
+    }
+  }, STREAM_CACHE_MS, true);
+  return Array.isArray(streams) ? streams : [];
+}
+
+/* Animasu menang kalau URL-nya sama: posisinya sudah lebih dulu di daftar.
+   Dedupe dilakukan SETELAH normalisasi supaya dua URL yang hanya beda
+   http/https atau host kapital tidak tampil dua kali. */
+function mergeMirrorStreams(...groups) {
+  const seen = new Set();
+  const hasil = [];
+  for (const group of groups) {
+    for (const stream of group || []) {
+      const url = normalisasiMirror(stream?.url);
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      hasil.push({ ...stream, url });
+    }
+  }
+  return hasil;
+}
+
+/* `detail.episode` di halaman detail Animasu adalah TOTAL ("12 Episode"),
+   bukan nomor update seperti di kartu jadwal. Hanya bentuk angka di awal
+   yang diterima; "Episode 12" tidak boleh dianggap total 12. */
+function totalEpisodeDiketahui(detail = {}) {
+  const kandidat = [detail?.totalEpisodes, detail?.total, detail?.episodeCount, detail?.episode];
+  for (const nilai of kandidat) {
+    const teks = teksAman(nilai).trim();
+    if (!teks) continue;
+    const angka = Number(teks);
+    if (Number.isInteger(angka) && angka > 0) return angka;
+    const langsung = teks.match(/^(\d+)\s*(?:episodes?|eps?)?$/i);
+    if (langsung) return Number(langsung[1]);
+    const berlabel = teks.match(/\b(\d+)\s*(?:episodes?|eps?)\b/i);
+    if (berlabel) return Number(berlabel[1]);
+  }
+  return 0;
+}
+
+/* Daftar dianggap lengkap kalau tidak ada lubang di 1..total. Kalau total
+   tidak dikirim sumber, lubang masih bisa dideteksi dari nomor tertinggi:
+   1,2,3,4,8 jelas tidak lengkap karena 8 > jumlah episode (5). */
+function daftarEpisodeLengkap(episodes = [], total = 0) {
+  if (!Array.isArray(episodes) || !episodes.length) return false;
+  const nomor = new Set();
+  for (const episode of episodes) {
+    const angka = Number(episode?.number);
+    if (Number.isFinite(angka) && angka > 0) nomor.add(angka);
+  }
+  if (!nomor.size) return false;
+  const tertinggi = Math.max(...nomor);
+  if (tertinggi > nomor.size) return false;
+  const jumlah = Number(total) || 0;
+  if (jumlah > 0) {
+    if (nomor.size < jumlah) return false;
+    for (let index = 1; index <= jumlah; index += 1) {
+      if (!nomor.has(index)) return false;
+    }
+  }
+  return true;
+}
+
+function perluSuplemenEpisode(episodes = [], total = 0, ongoing = false) {
+  return Boolean(ongoing) || !daftarEpisodeLengkap(episodes, total);
+}
+
+/* `detail.episode` di halaman detail Animasu adalah TOTAL ("12 Episode"),
+   bukan nomor update seperti di kartu jadwal. Hanya bentuk angka di awal
+   yang diterima; "Episode 12" tidak boleh dianggap total 12. */
+/* Daftar dianggap lengkap kalau tidak ada lubang di 1..total. Kalau total
+   tidak dikirim sumber, lubang masih bisa dideteksi dari nomor tertinggi:
+   1,2,3,4,8 jelas tidak lengkap karena 8 > jumlah episode (5). */
+
+/* `detail.episode` di halaman detail Animasu adalah TOTAL ("12 Episode"),
+   bukan nomor update seperti di kartu jadwal. Hanya bentuk angka di awal
+   yang diterima; "Episode 12" tidak boleh dianggap total 12. */
+function mergeSupplementEpisodes(primary = [], supplement1 = [], supplement2 = []) {
+  const byNumber = new Map();
+  for (const episode of primary) byNumber.set(episode.number, episode);
+  let added = 0;
+  for (const episode of supplement1) {
+    if (byNumber.has(episode.number)) continue;
+    byNumber.set(episode.number, episode);
+    added += 1;
+  }
+  for (const episode of supplement2) {
+    if (byNumber.has(episode.number)) continue;
+    byNumber.set(episode.number, episode);
+    added += 1;
+  }
+  return { episodes: [...byNumber.values()].sort((left, right) => left.number - right.number), added };
+}
+
+/* Batch unduhan: blok .bixbox .mctnx di halaman detail source. Tiap batch
+   punya judul (dengan rentang episode) dan baris per resolusi; tiap baris
+   punya tautan ke host pihak ketiga (Google Drive, Hxfile, acefile).
+   Situs tidak menyimpan filenya - ini hanya agregator tautan, jadi
+   tidak ada trafik unduhan yang lewat server kita. Tautan bisa
+   kedaluwarsa; karena itu tidak boleh di-cache lama.
+
+   Host yang DITAMPILKAN hanya empat: Google Drive, Mega, MediaFire, dan
+   Pixeldrain (permintaan Neo, 21 Oktober 2026). Host lain - Hxfile,
+   acefile, GoFile - sengaja dibuang, tidak cuma disembunyikan: tidak
+   ada gunanya membawa tautan yang tidak boleh dipakai. */
+const DOWNLOAD_HOST_ALLOW = [
+  /(^|\.)drive(\.usercontent)?\.google\.com$/i,
+  /(^|\.)mega\.(nz|co\.nz)$/i,
+  /(^|\.)mediafire\.com$/i,
+  /(^|\.)pixeldrain\.com$/i,
+];
+
+/* Resolver same-tab. Hanya Google Drive yang bisa dipakai: Pixeldrain
+   menolak hotlink dari origin lain (403 hotlink_detected) dan hanya
+   mengizinkan download dari halaman pixeldrain.com sendiri atau akun
+   premium. Memaksakannya lewat resolver membuat pengguna mendarat di JSON
+   403, jadi Pixeldrain tetap link-out. Validasi host memakai host PERSIS,
+   bukan endsWith, supaya "drive.google.com.evil.tld" tidak lolos. */
+const DOWNLOAD_DIRECT_HOSTS = new Set([
+  "drive.google.com",
+  "drive.usercontent.google.com",
+]);
+const DOWNLOAD_FILE_ID = /^[A-Za-z0-9_-]{6,128}$/;
+
+function idGoogleDrive(url, host) {
+  if (host === "drive.usercontent.google.com") {
+    return url.searchParams.get("id") || "";
+  }
+  if (host !== "drive.google.com") return "";
+  /* Folder bukan file: jangan bikin tautan download yang pasti gagal. */
+  if (/\/folders?\//i.test(url.pathname)) return "";
+  const file = url.pathname.match(/\/file\/d\/([^/]+)/i);
+  if (file) return file[1];
+  return url.searchParams.get("id") || "";
+}
+
+/* Validasi dasar untuk URL unduhan yang datang dari sumber luar. Semua
+   tautan yang tampil harus lolos di sini, baik untuk landing page maupun
+   redirect Drive. Tidak ada request jaringan. */
+function urlUnduhanAman(value) {
+  const raw = teksAman(value).trim();
+  if (!raw || raw.length > 4096) return null;
+  let url;
+  try { url = new URL(raw); } catch { return null; }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.username || url.password) return null;
+  if (url.port && url.port !== "80" && url.port !== "443") return null;
+  const host = url.hostname.toLowerCase().replace(/^www\./, "");
+  if (!DOWNLOAD_HOST_ALLOW.some((pola) => pola.test(host))) return null;
+  return { url, host };
+}
+
+/* Mengembalikan URL direct yang sudah kanonik, atau string kosong kalau
+   hostnya harus tetap link-out. */
+function targetUnduhanLangsung(value) {
+  const aman = urlUnduhanAman(value);
+  if (!aman) return "";
+  const { url, host } = aman;
+  if (!DOWNLOAD_DIRECT_HOSTS.has(host)) return "";
+  const id = idGoogleDrive(url, host);
+  if (!DOWNLOAD_FILE_ID.test(id)) return "";
+  return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(id)}&export=download&confirm=t`;
+}
+
+/* URL halaman perantara kita. Semua host yang diizinkan mendapat halaman
+   ini; file tetap mengalir dari host aslinya, bukan dari server kita. */
+function targetUnduhanHalaman(value) {
+  const aman = urlUnduhanAman(value);
+  return aman ? aman.url.toString() : "";
+}
+
+/* Token unduhan: payload ditandatangani HMAC supaya URL asli tidak perlu
+   ditulis di href dan tidak bisa diganti orang lain. Token kedaluwarsa;
+   nilai default 24 jam cukup untuk halaman detail yang dibuka lama. */
+const DOWNLOAD_TOKEN_SECRET = process.env.DOWNLOAD_TOKEN_SECRET || crypto.randomBytes(32);
+const DOWNLOAD_TOKEN_TTL_MS = Number(process.env.DOWNLOAD_TOKEN_TTL_MS) > 0 ? Number(process.env.DOWNLOAD_TOKEN_TTL_MS) : 24 * 60 * 60 * 1000;
+const DOWNLOAD_TOKEN_MAX = 8192;
+
+function potongTeks(nilai, batas) {
+  return teksAman(nilai).replace(/\s+/g, " ").trim().slice(0, batas);
+}
+
+function buatTokenUnduhan(value, meta = {}, opsi = {}) {
+  const url = targetUnduhanHalaman(value);
+  if (!url) return "";
+  const sekarang = Number(opsi.now) > 0 ? Number(opsi.now) : Date.now();
+  const ttl = Number(opsi.ttlMs) > 0 ? Number(opsi.ttlMs) : DOWNLOAD_TOKEN_TTL_MS;
+  const payload = {
+    /* Versi 2 = token hanya untuk tautan Samehadaku. Token versi 1 lama
+       masih bisa berisi tautan Animasu yang sudah mati; menolaknya lebih
+       baik daripada mengantar pengguna ke halaman 404. */
+    v: 2,
+    u: url,
+    l: potongTeks(meta.label, 80),
+    q: potongTeks(meta.quality, 40),
+    r: potongTeks(meta.range, 40),
+    s: potongTeks(meta.source, 20),
+    x: Math.floor((sekarang + ttl) / 1000),
+  };
+  const isi = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const tanda = crypto.createHmac("sha256", DOWNLOAD_TOKEN_SECRET).update(isi).digest("base64url");
+  return `${isi}.${tanda}`;
+}
+
+function bacaTokenUnduhan(token, opsi = {}) {
+  const mentah = teksAman(token).trim();
+  if (!mentah || mentah.length > DOWNLOAD_TOKEN_MAX) return null;
+  const bagian = mentah.split(".");
+  if (bagian.length !== 2 || !bagian[0] || !bagian[1]) return null;
+  const [isi, tanda] = bagian;
+  const harapan = crypto.createHmac("sha256", DOWNLOAD_TOKEN_SECRET).update(isi).digest("base64url");
+  const a = Buffer.from(tanda);
+  const b = Buffer.from(harapan);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  let payload;
+  try { payload = JSON.parse(Buffer.from(isi, "base64url").toString("utf8")); } catch { return null; }
+  if (!payload || payload.v !== 2) return null;
+  const sekarang = Number(opsi.now) > 0 ? Number(opsi.now) : Date.now();
+  if (!Number.isFinite(payload.x) || payload.x * 1000 <= sekarang) return null;
+  const url = targetUnduhanHalaman(payload.u);
+  if (!url) return null;
+  return { ...payload, u: url, host: new URL(url).hostname.toLowerCase().replace(/^www\./, "") };
+}
+
+function tautanUnduhan(value, meta = {}) {
+  const token = buatTokenUnduhan(value, meta);
+  return token ? `/unduh/${token}` : "";
+}
+
+/* Angka tanpa nol di depan: "001" -> "1", "0" -> "0". */
+function tanpaNolDepan(teks) {
+  const mentah = String(teks || "").trim();
+  const angka = Number(mentah);
+  return Number.isFinite(angka) ? String(angka) : mentah;
+}
+
+/* Rentang episode dari teks batch. Bentuknya bervariasi di source:
+     - "Batch Subtitle Indonesia [ 1 - 25 ]"        (kurung siku)
+     - "Batch Subtitle Indonesia Episode 001-025"    (tanpa kurung)
+     - "Episode 01-12 BD Batch Subtitle Indonesia"  (episode di depan)
+   Di luar kurung siku, angka WAJIB preceded kata "episode"/"ep" -
+   kalau tidak, tahun rilis ("2019-2020") atau nomor season akan salah
+   tangkap sebagai rentang episode. Kalau tak ada yang cocok, hasilnya
+   kosong: lebih baik kosong daripada menebak. */
+function ambilRentangEpisode(teks) {
+  const sumber = String(teks || "");
+  const kurung = sumber.match(/\[([\d\s.\-–—]+)\]/);
+  if (kurung) {
+    const isi = kurung[1];
+    const rentang = isi.match(/(\d{1,4})\s*[-–—]\s*(\d{1,4})/);
+    if (rentang) return `${tanpaNolDepan(rentang[1])}-${tanpaNolDepan(rentang[2])}`;
+    const tunggal = isi.match(/(\d{1,4})/);
+    return tunggal ? tanpaNolDepan(tunggal[1]) : "";
+  }
+  /* Samehadaku menulis "Episode BATCH 1-24 [END]" - ada kata di antara
+     "episode" dan angkanya. Jaraknya dibatasi supaya kalimat panjang tidak
+     menyeret angka milik keterangan lain. */
+  const rentang = sumber.match(/\b(?:episode|ep)\b[^\d]{0,24}(\d{1,4})\s*[---]\s*(\d{1,4})/i);
+  if (rentang) return `${tanpaNolDepan(rentang[1])}-${tanpaNolDepan(rentang[2])}`;
+  const tunggal = sumber.match(/\b(?:episode|ep)\b[\s:.\-]*(\d{1,4})/i);
+  return tunggal ? tanpaNolDepan(tunggal[1]) : "";
+}
+
+function parseDownloadBatches($, baseUrl = ANIMASU_BASE_URL) {
+  const batches = [];
+  $(".bixbox .mctnx").each((_, mctx) => {
+    /* Satu .mctnx berisi beberapa batch, masing-masing dibungkus .soraddlx.
+       Kalau pembungkusnya tidak ada, anggap .mctnx itu satu batch. */
+    const wrappers = $(mctx).find(".soraddlx").length ? $(mctx).find(".soraddlx") : $(mctx);
+    wrappers.each((__, wrapper) => {
+      const heading = $(wrapper).find(".sorattlx h3").first().text().trim();
+      if (!heading) return;
+      /* Rentang batch dipakai juga oleh token pop-up: baris resolusi tidak
+         menulis "Episode", jadi tanpa ini pop-up kehilangan konteks batch. */
+      const rentangBatch = ambilRentangEpisode(heading);
+      const mirrors = [];
+      $(wrapper).find(".soraurlx").each((___, row) => {
+        const labelBaris = $(row).find("strong").first().text().trim();
+        /* Kadang label baris BUKAN resolusi, tapi rentang episode
+           (mis. "01-25"). Kalau begitu dia jadi range, bukan kualitas. */
+        const rangeBaris = labelBaris.match(/^(\d{1,4})\s*[-–—]\s*(\d{1,4})$/);
+        const quality = rangeBaris ? "" : labelBaris;
+        const range = rangeBaris
+          ? `${tanpaNolDepan(rangeBaris[1])}-${tanpaNolDepan(rangeBaris[2])}`
+          : ambilRentangEpisode(labelBaris);
+        const links = [];
+        $(row).find("a[href]").each((____, anchor) => {
+          const href = ($(anchor).attr("href") || "").trim();
+          /* Hanya http(s). Skema lain (javascript:, data:) ditolak: nilainya
+             datang dari sumber luar dan masuk ke atribut href. */
+          if (!/^https?:\/\//i.test(href)) return;
+          let host = "";
+          try { host = new URL(href, baseUrl).hostname; } catch { host = ""; }
+          if (!DOWNLOAD_HOST_ALLOW.some((pola) => pola.test(host))) return;
+          const absolute = absoluteUrl(href, baseUrl);
+          const langsung = targetUnduhanLangsung(absolute);
+          const label = $(anchor).text().trim() || host || "Mirror";
+          const halaman = tautanUnduhan(absolute, { label, quality, range: range || rentangBatch, source: "animasu" });
+          links.push({
+            label,
+            url: absolute,
+            host,
+            ...(langsung ? { download: `/api/download?url=${encodeURIComponent(absolute)}` } : {}),
+            ...(halaman ? { page: halaman } : {}),
+          });
+        });
+        if ((quality || range) && links.length) mirrors.push({ quality, range, links });
+      });
+      if (!mirrors.length) return;
+      /* Rentang batch: dari judul kalau ada. Kalau tidak, dari union
+         rentang baris - anime seperti Naruto menulis rentangnya di
+         label baris, bukan di judul batch. */
+      let range = ambilRentangEpisode(heading);
+      if (!range) {
+        const rentangBaris = mirrors.map((m) => m.range).filter(Boolean).map((r) => r.split("-").map(Number));
+        if (rentangBaris.length) {
+          const mulai = Math.min(...rentangBaris.map((r) => r[0]));
+          const akhir = Math.max(...rentangBaris.map((r) => r[1]));
+          range = mulai === akhir ? String(mulai) : `${mulai}-${akhir}`;
+        }
+      }
+      batches.push({ title: heading, range, mirrors, source: "animasu" });
+    });
+  });
+  return batches;
+}
+
+/* Parser unduhan Samehadaku. Markup-nya BERBEDA dari Animasu: tidak ada
+   .bixbox/.mctnx/.soraurlx. Satu .download-eps = satu format (MKV/MP4/x265),
+   isinya <p><b>MKV</b></p> lalu <ul><li><strong>360p</strong> +
+   .download-eps-links. Batch berisi beberapa grup format; halaman episode
+   atau film hanya punya satu grup.
+
+   Host disaring dengan daftar yang SAMA seperti Animasu (Drive, Mega,
+   MediaFire, Pixeldrain). Gofile, Acefile, dan Krakenfiles tidak dibuang
+   karena "tidak penting", tetapi karena memang tidak boleh ditampilkan. */
+function parseSamehadakuDownloads(html, baseUrl = SAMEHADAKU_BASE_URL) {
+  const $ = cheerio.load(htmlAman(html));
+  const heading = $("h1").first().text().replace(/\s+/g, " ").trim();
+  const range = ambilRentangEpisode(heading);
+  const batches = [];
+  $(".download-eps").each((_, group) => {
+    const formatTeks = $(group).children("p").first().text().replace(/\s+/g, " ").trim();
+    /* <p> berisi judul lengkap ("... BATCH 1-24 [END] MKV"), bukan cuma
+       "MKV". Yang dikirim ke klien hanya token formatnya supaya catatan
+       kecil di daftar tautan tidak menjadi kalimat panjang. */
+    const format = [...new Set((formatTeks.match(/\b(?:MKV|MP4|HEVC|x265|AV1)\b/gi) || [])
+      .map((token) => token.toLowerCase() === "x265" ? "x265" : token.toUpperCase()))].join(" ");
+    const mirrors = [];
+    $(group).find("li").each((__, row) => {
+      const quality = $(row).children("strong").first().text().trim();
+      const links = [];
+      const seen = new Set();
+      $(row).find("a[href]").each((___, anchor) => {
+        const href = ($(anchor).attr("href") || "").trim();
+        if (!/^https?:\/\//i.test(href)) return;
+        let host = "";
+        try { host = new URL(href, baseUrl).hostname; } catch { host = ""; }
+        if (!DOWNLOAD_HOST_ALLOW.some((pola) => pola.test(host))) return;
+        const absolute = absoluteUrl(href, baseUrl);
+        if (seen.has(absolute)) return;
+        seen.add(absolute);
+        const langsung = targetUnduhanLangsung(absolute);
+        const label = $(anchor).text().replace(/\s+/g, " ").trim() || host || "Mirror";
+        const halaman = tautanUnduhan(absolute, { label, quality, range, source: "samehadaku" });
+        links.push({
+          label,
+          url: absolute,
+          host,
+          ...(langsung ? { download: `/api/download?url=${encodeURIComponent(absolute)}` } : {}),
+          ...(halaman ? { page: halaman } : {}),
+        });
+      });
+      if (links.length) mirrors.push({ quality, range: "", links });
+    });
+    if (!mirrors.length) return;
+    batches.push({
+      title: format ? `${heading} ${format}`.trim() : heading || "Download",
+      range,
+      format,
+      mirrors,
+      source: "samehadaku",
+    });
+  });
+  return batches;
+}
+
+function parseAnimeDetail(html, slug, baseUrl = ANIMASU_BASE_URL) {
+  const $ = cheerio.load(htmlAman(html));
+  const info = $(".infox");
+  const title = info.find("h1[itemprop='headline'], h1, .title").first().text().trim();
+  const synonym = info.find(".alter, .synonym, [class*=alternative]").first().text().trim();
+  const image = $(".bigcontent .thumb img, .thumb img, img[itemprop=image]").first().attr("src") || $(".bigcontent .thumb img, .thumb img").first().attr("data-src") || "";
+  const readInfo = (label) => info.find(".spe span").filter((_, element) => $(element).text().toLowerCase().startsWith(`${label}:`)).first().text().split(":").slice(1).join(":").trim();
+  const genres = [];
+  info.find(".spe span").first().find("a[href]").each((_, element) => genres.push({ name: $(element).text().trim(), slug: extractSlug($(element).attr("href")) }));
+  const episodes = [];
+  const episodeNodes = $("#daftarepisode li").length ? $("#daftarepisode li") : $("#daftarepisode a[href]");
+  episodeNodes.each((_, element) => {
+    const anchor = $(element).is("a") ? $(element) : $(element).find(".lchx a[href], a[href]").first();
+    const episodeSlug = extractSlug(anchor.attr("href"));
+    const episodeTitle = anchor.text().trim();
+    if (episodeSlug && episodeTitle) episodes.push({ episode: episodeTitle, slug: episodeSlug, sourceUrl: absoluteUrl(anchor.attr("href"), baseUrl), sourceProvider: "animasu" });
+  });
+  /* Rating: primary selector + beberapa fallback (markup source sering berubah);
+     angka format koma ("8,2") ikut dinormalisasi ke 8.2 */
+  const ratingCandidates = [
+    $(".rating strong").first().text(),
+    $("[itemprop=ratingValue]").first().attr("content") || $("[itemprop=ratingValue]").first().text(),
+    $(".rating, .score, .rtg").first().text(),
+    readInfo("rating"),
+    info.find("span").filter((_, el) => /rating/i.test($(el).text()) && /[0-9]/.test($(el).text())).first().text(),
+  ];
+  const rating = ratingCandidates.reduce((found, text) => {
+    if (found) return found;
+    const m = String(text || "").replace(",", ".").match(/(\d+(?:\.\d+)?)/);
+    const value = m ? Number(m[1]) : 0;
+    return value > 0 && value <= 10 ? value : 0;
+  }, 0);
+  return { slug, title, synonym, synopsis: $(".sinopsis p, .synopsis p").first().text().trim(), image: absoluteUrl(image, baseUrl), rating, genres, status: readInfo("status"), aired: readInfo("rilis"), type: readInfo("jenis") || "Unknown", episode: readInfo("episode") || "Unknown", duration: readInfo("durasi") || "Unknown", studio: readInfo("studio") || "Unknown", season: readInfo("musim") || "Unknown", trailer: $(".trailer iframe").attr("src") || "", updateAt: info.find("time[itemprop=dateModified]").attr("datetime") || "", episodes, batches: parseDownloadBatches($, baseUrl) };
+}
+
+async function fetchAnimeDetail(slug) {
+  const { result, source } = await sourceRequestFor("animasu", `/anime/${encodeURIComponent(slug)}/`, { headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS });
+  const detail = parseAnimeDetail(result.data, slug, source.baseUrl);
+  if (!detail.title) throw new Error("Animasu detail tidak berisi judul anime.");
+  detail.image = absoluteUrl(detail.image, source.baseUrl);
+  detail.sourceProvider = "animasu";
+  detail.sourceUrl = new URL(`/anime/${encodeURIComponent(slug)}/`, source.baseUrl).toString();
+  return detail;
+}
+
+async function fetchCatalogPage({ search = "", genre = "", page = 1, signal }) {
+  const paths = search ? [`/page/${page}/`, "/pencarian/"] : ["/pencarian/"];
+  let lastError;
+  let reachable = false;
+  for (const pathname of paths) {
+    try {
+      const { result, baseUrl } = await sourceRequest(pathname, { params: { s: search, halaman: page, urutan: "update", "genre[]": genre ? [genre] : [] }, headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, signal, validateStatus: SOURCE_ACCEPT_STATUS }, "search");
+      reachable = true;
+      const diagnostics = parseAnimeCardsWithDiagnostics(result.data);
+      if (diagnostics.data.length) return { data: diagnostics.data, hasNext: hasNextPage(result.data), diagnostics, source: baseUrl };
+      lastError = new Error("Source katalog mengembalikan halaman kosong.");
+    } catch (error) {
+      lastError = error;
+      if (error.sourceBlocked) break;
+    }
+  }
+  if (reachable) return { data: [], hasNext: false, diagnostics: { rawCount: 0, data: [], missingSlug: [] }, source: ANIMASU_BASE_URL };
+  if (lastError && !isSourceUnavailable(lastError)) markSourceFailure(lastError);
+  throw lastError || new Error("Animasu tidak dapat diakses.");
+}
+
+function decodeMirror(value) {
+  if (!value) return "";
+  let raw = teksAman(value).trim();
+  if (!raw) return "";
+  try { raw = decodeURIComponent(raw); } catch (_) { /* value was not URI encoded */ }
+  if (/^(https?:)?\/\//i.test(raw)) return absoluteUrl(raw);
+  try {
+    const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = Buffer.from(normalized, "base64").toString("utf8");
+    const $ = cheerio.load(decoded);
+    return absoluteUrl($("iframe").attr("src") || $("source").attr("src") || $("video").attr("src") || "");
+  } catch { return ""; }
+}
+
+/* Host shortener/iklan yang tidak boleh dipasang sebagai iframe. Mirror
+   yang memakai salah satunya akan membawa pengguna ke halaman lain, jadi
+   lebih baik tidak ditawarkan sama sekali.
+
+   TeraBox ikut diblokir: tautannya tidak bisa diputar di iframe (meminta
+   aplikasi/login) sehingga hanya menampilkan halaman kosong atau iklan.
+   Semua domain resmi dan subdomainnya ditolak. */
+const MIRROR_BLOCKED_HOSTS = [
+  "adf.ly", "shrinkme.io", "shrinkme.pro", "linkvertise.com", "linkvertise.net",
+  "ouo.io", "ouo.press", "sub2unlock.com", "sub2unlock.net", "short.icu",
+  "short.ink", "shorte.st", "sh.st", "bc.vc", "cuty.io", "exe.io", "gplinks.co",
+  "clk.sh", "za.gl", "za.uy", "mboost.me", "boost.ink", "yoshare.net",
+  "adsfly.co", "cutt.ly", "rebrand.ly", "bit.ly", "tinyurl.com", "t.co", "goo.gl",
+  "terabox.com", "teraboxapp.com", "terabox.app", "teraboxlink.com",
+  "1024tera.com", "4funbox.com",
+  /* Bukan player: plugin "like" Facebook dan kotak obrolan cbox pernah ikut
+     terbaca sebagai mirror Animasu ("Mirror 8"/"Mirror 9"). Keduanya hanya
+     menampilkan halaman kosong/asing di dalam pemutar. */
+  "facebook.com", "cbox.ws",
+];
+/* Jangan memblokir kata "ad" secara umum (bisa muncul di "adventure").
+   Yang dicek hanya penanda jalur iklan yang dikenal. */
+const MIRROR_BLOCKED_PATH = /(?:^|[\/._-])(?:popunder|popads|popcash|adsterra|propellerads|onclickads|hilltopads|juicyads|exoclick|trafficjunky|adsbatch\d*|adcash|adserver|adframe)(?:[\/._?&#-]|$)/i;
+const MIRROR_PRIVATE_HOST = /^(?:localhost|127\.|0\.0\.0\.0$|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/i;
+
+/* Validasi + normalisasi URL mirror. Skema selain http/https, kredensial
+   tertanam, port aneh, host shortener, dan IP privat ditolak. Ini bukan
+   proxy: iframe tetap dimuat langsung oleh browser pengguna. */
+function normalisasiMirror(value) {
+  const raw = teksAman(value).trim();
+  if (!raw || raw.length > 4096) return "";
+  let url;
+  try { url = new URL(raw); } catch { return ""; }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+  if (url.username || url.password) return "";
+  if (url.port && url.port !== "80" && url.port !== "443") return "";
+  const host = url.hostname.toLowerCase().replace(/^www\./, "");
+  if (!host || MIRROR_PRIVATE_HOST.test(host) || host === "::1" || host === "[::1]") return "";
+  if (MIRROR_BLOCKED_HOSTS.some((blocked) => host === blocked || host.endsWith(`.${blocked}`))) return "";
+  if (MIRROR_BLOCKED_PATH.test(`${url.pathname}${url.search}`)) return "";
+  return url.toString();
+}
+
+function parseMirrorOptions(html) {
+  const $ = cheerio.load(htmlAman(html));
+  const streams = [];
+  $(".mirror option, .mirrors option, select option[data-url], [data-mirror-url], .mirror a[href], .mirrors a[href], iframe[src], video source[src], video[src]").each((_, element) => {
+    const option = $(element);
+    const candidates = [option.attr("data-url"), option.attr("data-mirror-url"), option.attr("href"), option.attr("value"), option.attr("src")].filter(Boolean);
+    const url = candidates.map(decodeMirror).map(normalisasiMirror).find(Boolean) || "";
+    if (url) streams.push({ name: option.text().trim() || `Mirror ${streams.length + 1}`, url, source: "Animasu" });
+  });
+  const seen = new Set();
+  return streams.filter((stream) => !seen.has(stream.url) && seen.add(stream.url));
+}
+
+async function readMirrorOptions(episodeSlug, provider = "animasu", sourceUrl = "") {
+  const source = getSourceConfig(provider);
+  const pathName = sourceUrl ? new URL(sourceUrl).pathname : `/${encodeURIComponent(episodeSlug)}/`;
+  try {
+    const { result } = await sourceRequestFor(provider, pathName, { headers: SOURCE_HEADERS, timeout: REQUEST_TIMEOUT_MS, validateStatus: SOURCE_ACCEPT_STATUS });
+    return { reachable: true, streams: parseMirrorOptions(result.data).map((stream) => ({ ...stream, source: source.id })), meta: parseAnimasuEpisodeMeta(result.data, episodeSlug) };
+  } catch (error) {
+    return { reachable: false, streams: [], meta: null, error };
+  }
+}
+
+/* Nama mirror yang tampil ke pengguna TIDAK menyebut sumbernya. Label
+   sumber membuat orang tahu dari mana stream di-scrape; yang dibutuhkan
+   saat memilih mirror hanya nomor server dan resolusinya. Resolusi
+   dipendekkan ke dua digit pertama (480p -> 48p, 720p -> 72p,
+   1080p -> 10p) supaya nomor server bisa menempel tanpa spasi tambahan. */
+function singkatResolusi(nama) {
+  const cocok = /(\d{3,4})\s*p\b/i.exec(teksAman(nama));
+  return cocok ? `${cocok[1].slice(0, 2)}p` : "";
+}
+
+function labelMirror(streams, sumber) {
+  const daftar = Array.isArray(streams) ? streams : [];
+  if (sumber === "animasu") {
+    let generik = 0;
+    const hitung = new Map();
+    return daftar.map((stream) => {
+      const resolusi = singkatResolusi(stream?.name);
+      if (!resolusi) {
+        generik += 1;
+        return { ...stream, name: `MasuServer${generik}` };
+      }
+      const urutan = (hitung.get(resolusi) || 0) + 1;
+      hitung.set(resolusi, urutan);
+      return { ...stream, name: `MasuServer${resolusi}${urutan > 1 ? `(${urutan})` : ""}` };
+    });
+  }
+  if (sumber === "hianime") {
+    return daftar.map((stream, index) => ({ ...stream, name: `AnimeServer${index + 1}` }));
+  }
+  return daftar.map((stream, index) => {
+    const nomor = index + 1;
+    const resolusi = singkatResolusi(stream?.name);
+    const vip = /\bvip\b|stream/i.test(teksAman(stream?.name));
+    const name = vip ? `Server VIP ${nomor}` : resolusi ? `MegaServer ${nomor}${resolusi}` : `Server ${nomor}`;
+    return { ...stream, name };
+  });
+}
+
+/* Nomor server dihitung SETELAH dedupe. Kalau label dipasang sebelum
+   merge, satu URL Samehadaku yang sama dengan mirror Animasu ikut memakan
+   nomor sehingga yang tampil server 2, 3, 5 - bukan 1..3. */
+function labelMergedMirrors(merged) {
+  const jenis = (stream) => (stream?.source === "samehadaku" ? "samehadaku" : stream?.source === "hianimetv" ? "hianime" : "animasu");
+  return ["animasu", "samehadaku", "hianime"].flatMap((sumber) =>
+    labelMirror(merged.filter((stream) => jenis(stream) === sumber), sumber),
+  );
+}
+
+async function yaoMirrors(episodeSlug, provider = "animasu", sourceUrl = "") {
+  /* Episode yang lahir dari katalog HiAnime tidak punya halaman di Animasu.
+     Tanpa jalur cepat ini, satu permintaan mirror membuang dua request ke
+     Animasu yang pasti 404 sebelum akhirnya bertanya ke HiAnime. Kalau
+     HiAnime mengembalikan mirror, langsung pakai; kalau tidak, jalur lama
+     tetap dijalankan sebagai cadangan. */
+  const metaHianime = provider === "animasu" ? metaEpisodeHianimeTersimpan(episodeSlug) : null;
+  if (metaHianime) {
+    const cepat = await withTimeout(() => hianimeMirrorUntukEpisode(metaHianime), 9000, "HiAnime")
+      .catch((error) => { console.error(`Mirror Sora gagal untuk ${episodeSlug}: ${error.message}`); return []; });
+    if (cepat?.length) return labelMergedMirrors(mergeMirrorStreams([], [], cepat));
+  }
+  const direct = await readMirrorOptions(episodeSlug, provider, sourceUrl);
+  // Only Animasu can use the YAOI library fallback; other providers have their own HTML.
+  const libraryStreams = provider === "animasu" && !direct.streams.length ? await animasu.getStreams(episodeSlug, { noCache: true }).catch(() => []) : [];
+  const collected = [...direct.streams, ...(libraryStreams || []).map((stream) => ({ name: stream.name || "Mirror", url: absoluteUrl(stream.url), source: "YAOI API" }))];
+  /* Mirror Samehadaku dan HiAnime ditambahkan SETELAH mirror Animasu dan
+     berjalan PARALEL: satu sumber yang lambat tidak menahan yang lain, dan
+     total batas tunggu tetap 9 detik. Kalau Animasu mengembalikan mirror
+     yang tidak bisa diputar, pengguna tetap punya pilihan dari sumber lain.
+     Kegagalan salah satu sumber tidak boleh menjatuhkan route: mirror yang
+     sudah terkumpul tetap dikirim. Namanya diganti label netral (MasuServer,
+     Server, AnimeServer) supaya sumber scrape tidak terbaca pengguna. */
+  const meta = direct.meta || metaEpisodeHianimeTersimpan(episodeSlug) || (provider === "animasu" ? metaEpisodeDariSlug(episodeSlug) : null);
+
+  let hianimeStreams = [];
+  let samehadakuStreams = [];
+  if (provider === "animasu" && meta) {
+    const [hianime, samehadaku] = await Promise.all([
+      withTimeout(() => hianimeMirrorUntukEpisode(meta), 9000, "HiAnime")
+        .catch((error) => { console.error(`Mirror Sora gagal untuk ${episodeSlug}: ${error.message}`); return []; }),
+      withTimeout(() => samehadakuMirrorUntukEpisode(meta), 9000, "Samehadaku")
+        .catch((error) => { console.error(`Mirror Nema gagal untuk ${episodeSlug}: ${error.message}`); return []; }),
+    ]);
+    hianimeStreams = hianime;
+    samehadakuStreams = samehadaku;
+  }
+  const merged = mergeMirrorStreams(collected, samehadakuStreams, hianimeStreams);
+  return labelMergedMirrors(merged);
+}
+
+/* Di belakang reverse proxy (Railway, Render, Nginx), semua koneksi masuk
+   dari IP proxy sehingga clientKey() selalu sama dan rate limit jadi satu
+   kuota bersama untuk semua pengunjung. TRUST_PROXY=1 membuat Express
+   memakai X-Forwarded-For sebagai IP asli. Default mati: server yang
+   dibuka langsung ke internet tidak boleh mempercayai header itu.
+
+   NILAI 1, BUKAN true. `true` berarti percaya SEMUA proxy di rantai, jadi
+   pengunjung sendiri bisa mengirim `X-Forwarded-For: 1.2.3.4` dan
+  kuota-nya ikut pindah ke IP itu - spoofing rate limit, dan
+   IP asli ikut hilang dari log. Angka 1 berarti tepat satu hop: proxy
+   Railway yang sebenarnya, lalu Express mengambil IP asli dari hop
+   paling kanan yang ia percaya. Kalau nanti ada CDN di depan Railway,
+   naikkan ke 2 - satu per proxy yang benar-benar ada, bukan tebakan. */
+if (TRUST_PROXY) app.set("trust proxy", 1);
+/* Kunci integritas sisi server. Kalau seal di file ini berubah, route data
+   berhenti melayani isinya dan hanya mengembalikan design kosong. Bukan
+   pengaman sungguhan — siapa pun yang punya salinannya bisa mengubah
+   sekalian ceknya. Glass house, bukan benteng.
+
+   Cek ini memakai alat yang sama dengan `npm run seal:check`, jadi
+   benar-benar membaca pecahan dari file di disk — bukan sekadar
+   membandingkan literal dengan dirinya sendiri. */
+const SEAL_PHRASE = "copyright SoraNema";
+let sealIntact = null;
+function sealIsIntact() {
+  try {
+    const { collect, verifyAgainstManifest } = require("./scripts/seal");
+    return verifyAgainstManifest(collect()).ok;
+  } catch (error) {
+    console.error(`Gagal membaca kunci integritas: ${error.message}`);
+    return false;
+  }
+}
+app.use((request, response, next) => {
+  if (sealIntact === null) sealIntact = sealIsIntact();
+  if (sealIntact) return next();
+  if (request.path.startsWith("/api/")) return response.status(503).json({ data: [], total: 0, error: "Kunci integritas tidak valid. Aplikasi terkunci." });
+  next();
+});
+/* Batas body eksplisit: body JSON raksasa ditolak 413 oleh body-parser
+   sebelum sempat menghabiskan memori (temuan fuzz 6 Oktober 2026). */
+app.use(express.json({ limit: "100kb" }));
+/* Saat MAINTENANCE=1, "/" harus didaftar SEBELUM express.static, karena  
+   static otomatis menyajikan public/index.html untuk permintaan direktori
+   dan akan membayangi catch-all maintenance di bawah. */
+const MAINTENANCE_PAGE = path.join(__dirname, "public", "maintenance-page", "index.html");
+
+/* Shell SoraNema yang sudah terpasang memuat "?shell=apk". Pemeliharaan
+   resmi tidak boleh snare aplikasi yang sudah terpasang: pengguna tidak
+   punya tab browser yang bisa ditutup, dan halaman maintenance tidak punya
+   jalan keluar ke aplikasi. Pengunjung web tetap melihat halaman
+   maintenance seperti biasa - hanya shell terpasang yang dilewati.
+
+   Penandanya eksplisit, bukan dikira dari User-Agent: server tidak boleh
+   menebak siapa yang sedang bertanya. Tanpa parameter ini, perilakunya
+   persis seperti sebelumnya.
+
+   Pengecekan WAJIB di dalam handler, bukan di `if (MAINTENANCE)`: fungsi
+   harus dijalankan per permintaan. `if (MAINTENANCE && !dariShell)` akan
+   selalu salah karena fungsi selalu dianggap benar - maintenance mati
+   total untuk semua orang, termasuk pengunjung web. */
+function dariShellTerpasang(request) {
+  return String((request.query && request.query.shell) || "") === "apk";
+}
+function sajikanSesuaiMode(request, response) {
+  if (MAINTENANCE && !dariShellTerpasang(request)) {
+    return response.sendFile(MAINTENANCE_PAGE);
+  }
+  return response.sendFile(path.join(__dirname, "public", "index.html"));
+}
+
+if (MAINTENANCE) app.get("/", sajikanSesuaiMode);
+app.use("/vendor/animejs", express.static(path.join(__dirname, "node_modules", "animejs", "dist", "bundles")));
+app.use("/vendor/three", express.static(path.join(__dirname, "node_modules", "three", "build")));
+/* Aset yang membawa ?v= boleh di-cache setahun: nama versinya berubah setiap
+   file itu berubah. Aset tanpa versi tetap memakai max-age=0 bawaan Express,
+   jadi perbaikan CSS/JS tidak terjebak di cache pengguna lama. */
+app.use(express.static(path.join(__dirname, "public"), {
+  setHeaders(response) {
+    try {
+      const url = new URL(response.req.url, "http://localhost");
+      if (url.searchParams.has("v")) response.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    } catch (_) { /* URL aneh: biarkan header bawaan Express */ }
+  },
+}));
+app.get("/api/health", (_, response) => {
+  const primary = primarySourceState();
+  const publicView = { ok: true, sourceStatus: primary.status, bootId: BOOT_ID };
+  /* Jangan pernah di-cache: UI membandingkan bootId antar-panggilan untuk
+     mendeteksi restart. Salinan lama membuat restart tidak terlihat. */
+  response.set("Cache-Control", "no-store");
+  /* Tanpa detail, /api/health hanya memberi tahu hidup atau mati, itu saja
+     yang dibutuhkan visitor. Pemeriksa keamanan tidak boleh mendapat peta
+     internal: jumlah cache, berapa banyak IP yang sedang dilacak, pesan
+     error upstream, antrean, sampai konfigurasi rate limit. */
+  if (!HEALTH_DETAIL) return response.json(publicView);
+  response.json({ ...publicView, source: ANIMASU_BASE_URL, sources: [{ id: "yaoi", baseUrl: "npm:yaoi", status: "n/a", lastSuccessAt: null, lastAttemptAt: null, lastError: null }, ...snapshotSourceStates()], sourceId: primary.sourceId, sourceBaseUrl: primary.baseUrl, sourceLastSuccessAt: primary.lastSuccessAt, sourceLastError: primary.lastError, ...runtimeStats() });
+});
+
+async function collectCatalog(search, genre, signal) {
+  const found = [];
+  let partial = false;
+  const deadline = Date.now() + SEARCH_BUDGET_MS;
+  for (let page = 1; page <= MAX_SEARCH_PAGES; page += 1) {
+    if (signal?.aborted) throw new Error("Pencarian dibatalkan oleh client.");
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      if (!found.length) throw new Error(`Search timeout setelah ${SEARCH_BUDGET_MS}ms`);
+      partial = true;
+      break;
+    }
+    try {
+      const result = await withRetry(() => {
+        const attemptRemaining = deadline - Date.now();
+        if (attemptRemaining <= 0) throw new Error(`Search timeout setelah ${SEARCH_BUDGET_MS}ms`);
+        return withTimeout(() => fetchCatalogPage({ search, genre, page, signal }), attemptRemaining, "Search");
+      }, SEARCH_RETRY_COUNT, SEARCH_RETRY_BACKOFF_MS, signal);
+      const pageData = (result.data || []).filter((item) => !search || matchesTitle(item, search));
+      found.push(...pageData);
+      if (!result.hasNext || !pageData.length) break;
+    } catch (error) {
+      if (!found.length) throw error;
+      partial = true;
+      break;
+    }
+  }
+  return { data: uniqueBySlug(found).map(titleAliasRecord), partial, provider: "animasu" };
+}
+
+async function searchCatalog(search, genre, signal) {
+  const errors = [];
+  let successfulAttempt = false;
+  /* HiAnime ikut HANYA untuk pencarian teks. Katalog genre dan jadwal tetap
+     Animasu: taksonomi genrenya berbeda, dan mencampurnya membuat filter
+     genre berisi judul yang tidak cocok. */
+  const bolehGabung = Boolean(normalizeSearchText(search)) && !normalizeSearchText(genre) && hianimeModeApi();
+  const cadanganHianime = bolehGabung
+    ? withTimeout(() => cariKatalogHianime(search), 5000, "Katalog HiAnime")
+      .catch((error) => { console.error(`Katalog HiAnime gagal untuk "${search}": ${error.message}`); return []; })
+    : Promise.resolve([]);
+  const gabung = async (utama, provider, aliasUsed = "", partial = false) => {
+    const tambahan = await cadanganHianime;
+    const data = gabungKartuKatalog(utama, tambahan);
+    return {
+      data,
+      aliasUsed,
+      partial,
+      provider: utama.length ? provider : (tambahan.length ? "hianimetv" : provider),
+    };
+  };
+  for (const source of SOURCE_CONFIGS) {
+    try {
+      const direct = await collectCatalog(search, genre, signal, source.id);
+      successfulAttempt = true;
+      if (direct.data.length || !search) return await gabung(direct.data, source.id, "", direct.partial);
+    } catch (error) { errors.push(error); }
+  }
+  const aliases = await fetchEnglishAliases(search);
+  for (const alias of aliases) {
+    if (signal?.aborted) throw new Error("Pencarian dibatalkan oleh client.");
+    for (const source of SOURCE_CONFIGS) {
+      try {
+        const result = await collectCatalog(alias, genre, signal, source.id);
+        successfulAttempt = true;
+        if (result.data.length) return await gabung(result.data, source.id, alias, result.partial);
+      } catch (error) { errors.push(error); }
+    }
+  }
+  /* Animasu gagal total bukan berarti pencarian mati: kalau HiAnime punya
+     hasil, kirim itu dengan jujur sebagai provider HiAnime. */
+  const tambahan = await cadanganHianime;
+  if (tambahan.length) return { data: tambahan, aliasUsed: "", partial: false, provider: "hianimetv" };
+  if (errors.length && !successfulAttempt) throw errors.at(-1);
+  return { data: [], aliasUsed: "", partial: false, provider: "none" };
+}
+
+/* Kunci cache harus dihitung dengan cara yang sama persis seperti di route,
+   supaya "gratis" benar-benar berarti request itu dilayani memory cache. */
+function catalogBudgetKey(request) { return `catalog:${normalizeSearchText(String(request.query.search || "").trim().slice(0, 100))}:${normalizeSearchText(String(request.query.genre || "").trim().slice(0, 80))}`; }
+const catalogRateLimit = upstreamBudget(searchBucket, (request) => {
+  const key = catalogBudgetKey(request);
+  return isFreshCacheKey(key) || pending.has(key);
+}, "Terlalu banyak pencarian. Tunggu sebentar lalu coba lagi.");
+
+app.get("/api/catalog", upstreamQueueGuard, catalogRateLimit, async (request, response) => {
+  const search = String(request.query.search || "").trim().slice(0, 100);
+  const genre = String(request.query.genre || "").trim().slice(0, 80);
+  const key = `catalog:${normalizeSearchText(search)}:${normalizeSearchText(genre)}`;
+  if (search && normalizeSearchText(search).length < MIN_SEARCH_LENGTH) return response.json({ data: [], slides: [], total: 0, slideSize: SLIDE_SIZE, provider: "local", stale: false, notice: `Masukkan minimal ${MIN_SEARCH_LENGTH} karakter untuk mencari.` });
+  const abortController = new AbortController();
+  request.on("close", () => { if (!response.writableEnded) abortController.abort(); });
+  try {
+    const result = await cached(key, () => searchCatalog(search, genre, abortController.signal));
+    const data = result.data || [];
+    if (data.length) return response.json({ data, slides: slices(data), total: data.length, slideSize: SLIDE_SIZE, provider: result.provider || "yaoi", aliasUsed: result.aliasUsed || "", partial: Boolean(result.partial), stale: false });
+    response.json({ data: [], slides: [], total: 0, slideSize: SLIDE_SIZE, provider: result.provider || "none", aliasUsed: "", stale: false, notice: "Source merespons tetapi tidak menemukan judul yang cocok." });
+  } catch (error) {
+    if (abortController.signal.aborted) return;
+    response.status(503).json({ data: [], slides: [], total: 0, error: `Source live tidak tersedia: ${error.message}` });
+  }
+});
+
+app.get("/api/daily", upstreamBudget(contentBucket, (request) => isFreshCacheKey(`daily:${todayKey()}`, DAILY_CACHE_MS) || pending.has(`daily:${todayKey()}`), "Terlalu banyak permintaan jadwal. Coba lagi sebentar lagi."), async (_, response) => {
+  try {
+    const key = `daily:${todayKey()}`;
+    const result = await cached(key, dailyWithSources, DAILY_CACHE_MS, true);
+    const data = result?.data || [];
+    if (data.length) return response.json({ data, slides: slices(data), total: data.length, slideSize: SLIDE_SIZE, day: todayKey(), label: todayLabel(), provider: result.provider || "yaoi", stale: isStale(key) });
+    throw new Error("Animasu tidak mengembalikan judul jadwal.");
+  } catch (error) {
+    const fallback = readFallbackDaily();
+    if (fallback?.data?.length) return response.json({ ...fallback, day: todayKey(), label: `Source offline · data terakhir ${fallback.label || "tersedia"}`, warning: `Jadwal live sedang tidak merespons; menampilkan snapshot lokal terakhir. (${error.message})` });
+    response.status(503).json({ data: [], slides: [], total: 0, day: todayKey(), label: todayLabel(), error: `Jadwal live tidak tersedia: ${error.message}` });
+  }
+});
+
+app.get("/api/genres", upstreamBudget(contentBucket, (request) => isFreshCacheKey("genres") || pending.has("genres"), "Terlalu banyak permintaan genre. Coba lagi sebentar lagi."), async (_, response) => {
+  try {
+    const key = "genres";
+    const result = await cached(key, genresWithSources, CACHE_MS, true);
+    if (!result?.data?.length) throw new Error("Source live tidak mengembalikan genre.");
+    response.json({ data: result.data, provider: result.provider || "yaoi", stale: isStale(key) });
+  } catch (error) { response.status(503).json({ data: [], error: `Genre live tidak tersedia: ${error.message}` }); }
+});
+
+/* Rekomendasi populer dan genre. `genre` kosong = populer; `genre` diisi
+   nama genre dari Local Storage (mis. "Aksi") = rekomendasi genre itu. */
+function recommendationCacheKey(request) {
+  const genre = String(request.query.genre || "").trim().slice(0, 80);
+  return genre ? `rec:genre:${normalizeSearchText(genre)}` : `rec:popular:${todayKey()}`;
+}
+const recommendationRateLimit = upstreamBudget(contentBucket, (request) => {
+  const key = recommendationCacheKey(request);
+  return isFreshCacheKey(key, REC_CACHE_MS) || pending.has(key);
+}, "Terlalu banyak permintaan rekomendasi. Coba lagi sebentar lagi.");
+app.get("/api/recommendations", upstreamQueueGuard, recommendationRateLimit, async (request, response) => {
+  const genre = String(request.query.genre || "").trim().slice(0, 80);
+  const key = recommendationCacheKey(request);
+  try {
+    const result = await cached(key, () => (genre ? genreRecommendations(genre) : popularRecommendations()), REC_CACHE_MS, true);
+    const data = result?.data || [];
+    response.json({
+      data,
+      total: data.length,
+      genre: result?.genre || genre,
+      genreSlug: result?.genreSlug || "",
+      source: data.some((item) => item.anilistMatched) ? "anilist" : "animasu",
+      notice: result?.notice || "",
+      stale: isStale(key),
+    });
+  } catch (error) {
+    response.status(503).json({ data: [], total: 0, error: `Rekomendasi tidak tersedia: ${error.message}` });
+  }
+});
+
+app.get("/api/anime/:slug", upstreamQueueGuard, upstreamBudget(detailBucket, (request) => {
+  const slug = request.params.slug;
+  /* Slug menentukan provider, tapi budget tidak tahu itu sebelum request
+     dijalankan. Cek dua kunci: hasil yang sudah di-cache tidak boleh
+     menghabiskan kuota hanya karena provider-nya berbeda. */
+  return isFreshCacheKey(`detail:animasu:${slug}`, DETAIL_CACHE_MS)
+    || isFreshCacheKey(`detail:hianimetv:${slug}`, DETAIL_CACHE_MS)
+    || pending.has(`detail:animasu:${slug}`)
+    || pending.has(`detail:hianimetv:${slug}`);
+}, "Terlalu banyak permintaan detail. Tunggu sebentar lalu coba lagi."), async (request, response) => {
+  try {
+    /* Animasu dulu; HiAnime hanya kalau slug itu tidak ada di Animasu. */
+    const { detail: cachedDetail, provider, cacheKey } = await fetchDetailDenganCadangan(request.params.slug);
+    /* Batch Animasu tidak pernah dikirim ke klien: tautannya banyak yang
+       sudah mati. Blok unduhan hanya diisi endpoint Samehadaku. */
+    const detail = { ...cachedDetail, batches: [] };
+    /* Unduhan Samehadaku TIDAK diambil di sini. Satu judul bisa butuh lima
+       request berurutan ke Samehadaku, dan halaman detail tidak boleh
+       menunggu selama itu. Klien memanggil /api/anime/:slug/downloads
+       setelah halaman tampil; batch Animasu di bawah tetap dikirim sebagai
+       cadangan kalau endpoint itu gagal. */
+    let episodes = normalizeEpisodes(detail.episodes || []);
+    const totalEpisode = totalEpisodeDiketahui(detail);
+    /* Episode boleh datang dari tiga sumber. Animasu tetap primary;
+       Samehadaku dan HiAnime hanya mengisi nomor yang belum ada. Keduanya
+       dipanggil PARALEL supaya kegagalan salah satu tidak menjatuhkan
+       halaman dan latensi tidak menumpuk. Panggilan hanya dilakukan kalau
+       daftar terdeteksi tidak lengkap atau anime masih tayang - anime
+       tamah yang sudah 1..12 tidak perlu dua request tambahan. */
+    /* Detail dari HiAnime sudah membawa daftar episode lengkap. Menanyakan
+       Samehadaku dan HiAnime lagi hanya menambah dua request tanpa mengisi
+       lubang - dan nomor episode dari sumber lain bisa bertabrakan. */
+    const dariHianime = detail.sourceProvider === "hianimetv";
+    let supplementedFrom = [];
+    let statusSamehadaku = "";
+    let statusHianime = "";
+    const ongoingAnimasu = statusOngoing(detail.status);
+    if (!dariHianime && perluSuplemenEpisode(episodes, totalEpisode, ongoingAnimasu)) {
+      const kunciSuplemen = detail.slug || request.params.slug;
+      const [samehadaku, hianime] = await Promise.all([
+        cached(`supplement:samehadaku:${kunciSuplemen}`, () => fetchSamehadakuEpisodes(detail.title, detail.synonym), DETAIL_CACHE_MS, true)
+          .catch((error) => { console.error(`Suplemen Samehadaku gagal untuk "${detail.title}": ${error.message}`); return null; }),
+        cached(`supplement:hianimetv:${kunciSuplemen}`, () => fetchHianimeEpisodes(kunciSuplemen, detail.title, detail.synonym), DETAIL_CACHE_MS, true)
+          .catch((error) => { console.error(`Suplemen HiAnime gagal untuk "${detail.title}": ${error.message}`); return null; }),
+      ]);
+      if (samehadaku) {
+        const mergedSamehadaku = mergeSupplementEpisodes(episodes, normalizeEpisodes(samehadaku.episodes || []));
+        if (mergedSamehadaku.added) { episodes = mergedSamehadaku.episodes; supplementedFrom.push("samehadaku"); }
+        statusSamehadaku = samehadaku.status || "";
+      }
+      if (hianime) {
+        const mergedHianime = mergeSupplementEpisodes(episodes, normalizeEpisodes(hianime.episodes || []));
+        if (mergedHianime.added) { episodes = mergedHianime.episodes; supplementedFrom.push("hianimetv"); }
+        statusHianime = hianime.status || "";
+      }
+    }
+
+    /* "Masih tayang" itu fakta dari TIGA sumber. Animasu yang jadi
+       penentu; Samehadaku dan HiAnime boleh MENEGUR (kalau bilang selesai,
+       bukan ongoing) tapi tidak boleh menghidupkan. Samehadaku dan HiAnime
+       hanya dicek kalau supplement jalan - menambah satu request per anime
+       memakan kuota upstream, dan itu sudah jadi peringatan di
+       playbook. */
+    const ongoingSamehadaku = statusSamehadaku ? statusOngoing(statusSamehadaku) : null;
+    const ongoingHianime = statusHianime ? statusOngoing(statusHianime) : null;
+    const ongoing = ongoingAnimasu && ongoingSamehadaku !== false && ongoingHianime !== false;
+
+    /* Unduhan selalu berasal dari Samehadaku. Detail tidak membawa batch
+       Animasu sama sekali, jadi tidak ada tautan mati yang sempat tampil
+       sebelum endpoint unduhan menjawab. */
+    const downloadProvider = "";
+
+    /* hasEpisodes dikirim terpisah: "anime ini belum ada episodenya" adalah
+       jawaban yang SAH, bukan kegagalan. Tanpa flag ini, klien menampilkan
+       pesan error untuk hal yang sebenarnya hanya belum tayang. */
+    /* Flag ongoing ikut masuk ke payload data (bukan cuma di akar
+       respons): klien menyimpan response.data sebagai state.detail,
+       jadi kalau flagnya hanya di akar, sisi klien tidak pernah
+       melihatnya. */
+    response.json({ data: titleAliasRecord({ ...detail, episodes, totalEpisodes: totalEpisode || undefined, availableEpisodes: episodes.length, hasEpisodes: episodes.length > 0, ongoing }), provider: detail.sourceProvider || provider, hasEpisodes: episodes.length > 0, ongoing, supplementedFrom: supplementedFrom.join(","), downloadProvider, stale: isStale(cacheKey) });
+  } catch (error) {
+    const fallback = fallbackDetailFromDaily(request.params.slug);
+    if (fallback) return response.json({ data: fallback, provider: "local-snapshot", stale: true, warning: `Detail live tidak tersedia (${error.message}); metadata dasar dari snapshot lokal ditampilkan.` });
+    const kode = detailErrorStatus(error);
+    response.status(kode).json({ data: null, error: kode === 404 ? "Anime ini tidak ditemukan di source." : `Source anime tidak dapat membaca detail ini: ${error.message}` });
+  }
+});
+
+/* ---------- Unduhan dua sumber (on-demand) ----------
+   Batch Animasu sudah ikut di detail yang di-cache. Samehadaku diambil di
+   endpoint ini karena satu judul bisa berarti lima request berurutan (cari,
+   halaman anime, lalu sampai tiga halaman batch) - menahannya di route detail
+   membuat halaman terasa mati. Endpoint ini dipanggil klien setelah halaman
+   detail tampil. Bila Samehadaku belum menjawab dalam DOWNLOAD_WAIT_MS,
+   batch Animasu tetap dikirim dengan `pending: true`; tugas Samehadaku
+   berjalan di belakang dan klien mencoba sekali lagi. */
+app.get("/api/anime/:slug/downloads", upstreamQueueGuard, upstreamBudget(detailBucket, (request) => {
+  const key = `downloads:route:${request.params.slug}`;
+  return isFreshCacheKey(key, DOWNLOAD_RESULT_TTL_MS) || pending.has(key);
+}, "Terlalu banyak permintaan unduhan. Tunggu sebentar lalu coba lagi."), async (request, response) => {
+  const slug = String(request.params.slug || "");
+  const key = `downloads:route:${slug}`;
+  try {
+    const hasil = await cached(key, async () => {
+      const detail = await cached(`detail:animasu:${slug}`, () => fetchAnimeDetail(slug), DETAIL_CACHE_MS, true);
+      if (!detail?.title) throw new Error("detail tidak memiliki data yang valid");
+      /* Batch Animasu sudah ikut di detail yang di-cache: tidak ada request
+         tambahan untuk mendapatkannya. */
+      const batchesAnimasu = Array.isArray(detail.batches) ? detail.batches : [];
+      let batchesSamehadaku = [];
+      let pendingSamehadaku = false;
+      try {
+        batchesSamehadaku = await withTimeout(
+          () => batchSamehadakuTersimpan(detail.title, detail.synonym),
+          DOWNLOAD_WAIT_MS,
+          "Unduhan Samehadaku",
+        );
+      } catch (error) {
+        /* Timeout bukan kegagalan permanen: tugas Samehadaku tetap berjalan
+           dan menyimpan hasilnya di cache. Klien boleh mencoba sekali lagi;
+           panggilan berikutnya akan menunggu tugas yang sama, bukan memulai
+           dari nol. */
+        if (/timeout setelah/i.test(error.message)) pendingSamehadaku = true;
+        else console.error(`Batch Samehadaku gagal untuk "${detail.title}": ${error.message}`);
+      }
+      return { ...pilihBatchUnduhan(batchesAnimasu, batchesSamehadaku), pending: pendingSamehadaku };
+    }, DOWNLOAD_RESULT_TTL_MS, true);
+    /* Hasil kosong tidak boleh mengunci percobaan berikutnya selama 20-60
+       detik. Hasil yang masih menunggu Samehadaku juga jangan di-cache
+       penuh: klien akan mencoba sekali lagi, dan percobaan itu harus
+       membaca batch Samehadaku yang mungkin sudah selesai di cache batch. */
+    if (!hasil.batches.length || hasil.pending) memory.delete(key);
+    response.json({ data: hasil.batches, provider: hasil.provider, fallback: false, pending: Boolean(hasil.pending) });
+  } catch (error) {
+    const kode = detailErrorStatus(error);
+    response.status(kode).json({
+      data: [],
+      provider: "",
+      fallback: false,
+      pending: false,
+      error: kode === 404 ? "Anime ini tidak ditemukan di source." : `Unduhan tidak dapat dimuat: ${error.message}`,
+    });
+  }
+});
+
+/* ---------- Suplemen Episode dari Tiga Sumber ----------
+   Endpoint untuk menyediakan data episode lengkap dari tiga sumber:
+   Animasu (primary), Samehadaku, dan HiAnime.
+   Digunakan untuk verifikasi dan melengkapi daftar episode. */
+app.get("/api/anime/:slug/episode-supplement", upstreamQueueGuard, upstreamBudget(detailBucket, (request) => { const key = `detail:animasu:${request.params.slug}`; return isFreshCacheKey(key, DETAIL_CACHE_MS) || pending.has(key); }, "Terlalu banyak permintaan suplemen episode. Tunggu sebentar lalu coba lagi."), async (request, response) => {
+  const provider = "animasu";
+  const key = `detail:${provider}:${request.params.slug}`;
+  try {
+    const detail = await cached(key, () => fetchAnimeDetail(request.params.slug, provider), DETAIL_CACHE_MS, true);
+    if (!detail?.title) throw new Error("detail tidak memiliki data yang valid");
+
+    let episodes = normalizeEpisodes(detail.episodes || []);
+    const totalEpisode = totalEpisodeDiketahui(detail);
+    const ongoingAnimasu = statusOngoing(detail.status);
+    const kunciSuplemen = detail.slug || request.params.slug;
+    const [samehadaku, hianime] = await Promise.all([
+      cached(`supplement:samehadaku:${kunciSuplemen}`, () => fetchSamehadakuEpisodes(detail.title, detail.synonym), DETAIL_CACHE_MS, true)
+        .catch((error) => { console.error(`Suplemen Samehadaku gagal untuk "${detail.title}": ${error.message}`); return null; }),
+      cached(`supplement:hianimetv:${kunciSuplemen}`, () => fetchHianimeEpisodes(kunciSuplemen, detail.title, detail.synonym), DETAIL_CACHE_MS, true)
+        .catch((error) => { console.error(`Suplemen HiAnime gagal untuk "${detail.title}": ${error.message}`); return null; }),
+    ]);
+
+    let supplementedFrom = [];
+    let statusSamehadaku = "";
+    let statusHianime = "";
+    if (samehadaku) {
+      const mergedSamehadaku = mergeSupplementEpisodes(episodes, normalizeEpisodes(samehadaku.episodes || []));
+      if (mergedSamehadaku.added) { episodes = mergedSamehadaku.episodes; supplementedFrom.push("samehadaku"); }
+      statusSamehadaku = samehadaku.status || "";
+    }
+    if (hianime) {
+      const mergedHianime = mergeSupplementEpisodes(episodes, normalizeEpisodes(hianime.episodes || []));
+      if (mergedHianime.added) { episodes = mergedHianime.episodes; supplementedFrom.push("hianimetv"); }
+      statusHianime = hianime.status || "";
+    }
+
+    const ongoingSamehadaku = statusSamehadaku ? statusOngoing(statusSamehadaku) : null;
+    const ongoingHianime = statusHianime ? statusOngoing(statusHianime) : null;
+    const ongoing = ongoingAnimasu && ongoingSamehadaku !== false && ongoingHianime !== false;
+
+    response.json({
+      data: titleAliasRecord({ ...detail, episodes, totalEpisodes: totalEpisode || undefined, availableEpisodes: episodes.length, hasEpisodes: episodes.length > 0, ongoing }),
+      provider: detail.sourceProvider || provider,
+      hasEpisodes: episodes.length > 0,
+      ongoing,
+      supplementedFrom: supplementedFrom.join(","),
+      stale: isStale(key),
+    });
+  } catch (error) {
+    console.error(`Suplemen gagal untuk "${request.params.slug}": ${error.message}`);
+    response.status(502).json({ data: [], error: "Gagal mengambil suplemen episode" });
+  }
+});
+
+app.get("/api/streams/:episodeSlug", upstreamQueueGuard, upstreamBudget(streamBucket, (request) => { const key = `streams:yaoi:${request.params.episodeSlug}`; return isFreshCacheKey(key, STREAM_CACHE_MS) || pending.has(key); }, "Terlalu banyak permintaan mirror. Tunggu sebentar lalu coba lagi."), async (request, response) => {
+  const provider = "yaoi";
+  try {
+    const key = `streams:${provider}:${request.params.episodeSlug}`;
+    const data = await cached(key, () => yaoMirrors(request.params.episodeSlug, "animasu"), STREAM_CACHE_MS, true);
+    if (!data?.length) throw new Error("mirror tidak memiliki data yang valid");
+    response.json({ data, total: data.length, provider, stale: isStale(key) });
+  } catch (error) { const kode = detailErrorStatus(error); response.status(kode).json({ data: [], total: 0, error: kode === 404 ? "Mirror untuk episode ini tidak ditemukan." : `${provider} tidak dapat membaca mirror: ${error.message}` }); }
+});
+
+/* ---------- Laporan tautan mati: kirim & baca ----------
+   POST dari tombol "tandai mati" di klien. GET dipakai halaman untuk
+   menyembunyikan tautan yang sudah dilaporkan cukup banyak orang. Tidak ada
+   URL maupun IP di permintaan/balasan: id-nya hash tautan, pelapornya hash
+   token acak browser. */
+app.post("/api/laporan-tautan", (request, response) => {
+  const verdict = laporanBucket.take(clientKey(request));
+  if (!verdict.allowed) return rateLimitResponse(response, verdict, "Terlalu banyak laporan. Coba lagi sebentar lagi.");
+  const hasil = catatLaporanTautan(request.body);
+  if (!hasil) return response.status(400).json({ ok: false, error: "Laporan tidak valid." });
+  response.set("Cache-Control", "no-store");
+  return response.json({ ok: true, jumlah: hasil.jumlah, ambang: hasil.ambang });
+});
+
+app.get("/api/laporan-tautan", (request, response) => {
+  const verdict = laporanBacaBucket.take(clientKey(request));
+  if (!verdict.allowed) return rateLimitResponse(response, verdict, "Terlalu banyak permintaan laporan. Coba lagi sebentar lagi.");
+  const episode = String(request.query.episode || "").trim().toLowerCase();
+  if (episode && !POLA_SLUG_LAPORAN.test(episode)) return response.status(400).json({ data: [], error: "Episode tidak valid." });
+  response.set("Cache-Control", "no-store");
+  return response.json(laporanTautanPublik({ episode }));
+});
+
+/* Resolver unduhan same-tab. 302 ke endpoint direct Google Drive; host lain
+   tidak pernah sampai ke sini karena renderer hanya memakai resolver untuk
+   tautan yang diberi field `download` oleh parseDownloadBatches(). */
+app.get("/api/download", downloadRateLimit, (request, response) => {
+  const target = targetUnduhanLangsung(request.query.url);
+  if (!target) return halamanUnduhanGagal(response, 400, "Tautan unduhan ini belum didukung.");
+  response.set("Cache-Control", "no-store");
+  response.set("Referrer-Policy", "no-referrer");
+  return response.redirect(302, target);
+});
+
+/* Halaman perantara untuk SEMUA host unduhan yang diizinkan. Token ditandatangani
+   server, jadi href di aplikasi tidak memuat URL sumber. Drive mendapat tombol
+   direct same-tab; Mega, MediaFire, dan Pixeldrain membuka halaman host karena
+   mereka butuh halaman asalnya (Pixeldrain bahkan menolak hotlink). */
+app.get("/unduh/:token", (request, response, next) => {
+  if (request.query.direct === "1") return downloadRateLimit(request, response, next);
+  return next();
+}, (request, response) => {
+  response.set("Cache-Control", "no-store");
+  response.set("Referrer-Policy", "no-referrer");
+  response.set("X-Robots-Tag", "noindex, nofollow");
+  const sebagaiJson = request.query.format === "json";
+  const data = bacaTokenUnduhan(request.params.token);
+  if (!data) {
+    if (sebagaiJson) return response.status(410).json({ data: null, error: "Link unduhan tidak valid atau sudah kedaluwarsa." });
+    return halamanUnduhanGagal(response, 410, "Link unduhan tidak valid atau sudah kedaluwarsa.");
+  }
+  if (request.query.direct === "1") {
+    const target = targetUnduhanLangsung(data.u);
+    if (!target) {
+      if (sebagaiJson) return response.status(400).json({ data: null, error: "Host ini tidak mendukung unduhan langsung." });
+      return halamanUnduhanGagal(response, 400, "Host ini tidak mendukung unduhan langsung.");
+    }
+    return response.redirect(302, target);
+  }
+  /* Pop-up di aplikasi membaca bentuk JSON supaya tidak perlu menyalin
+     catatan host dan aturan direct dari halaman HTML. */
+  if (sebagaiJson) {
+    response.set("Vary", "Accept");
+    return response.json({ data: detailUnduhan(data) });
+  }
+  return response.type("html").send(halamanUnduhan(data, request.params.token));
+});
+
+/* --------------------------------------------------------------------------
+   Halaman maintenance (public/maintenance-page/index.html)
+   - GET /maintenance          : selalu tersedia untuk preview kapan saja.
+   - MAINTENANCE=1             : semua route non-API menyajikan halaman
+                                 maintenance sebagai halaman utama; semua
+                                 /api/* TETAP hidup (playback dari storage).
+   -------------------------------------------------------------------------- */
+app.get("/maintenance", (_, response) => response.sendFile(MAINTENANCE_PAGE));
+/* Route /api/* yang tidak dikenal HARUS dibalas JSON 404, bukan halaman SPA.
+   Sebelumnya apa pun di bawah /api/ jatuh ke catch-all "*" sehingga klien
+   menerima HTML dengan status 200; api.js lalu gagal saat JSON.parse dan
+   melaporkan "respons tidak valid (HTTP 200)" untuk kesalahan yang
+   sebenarnya cuma route yang tidak ada. Search engine dan uptime monitor
+   juga salah membaca status karena melihat 200 di mana-mana. */
+app.all("/api/*", (request, response) => {
+  response.status(404).json({ error: `Endpoint tidak ditemukan: ${request.method} ${request.path}` });
+});
+/* Shell terpasang (lihat dariShellTerpasang di atas) melewati mode
+   maintenance dan menerima halaman aplikasi seperti biasa. */
+app.get("*", sajikanSesuaiMode);
+/* Global error handler — WAJIB terdaftar paling akhir setelah semua rute.
+   Tanpa ini, URI cacat (mis. /%ff) atau JSON body korup melempar URIError/
+   SyntaxError ke handler default Express: HTML stack trace + log terminal
+   penuh (temuan fuzz 6 Oktober 2026). Status diambil dari error bila ada
+   (mis. 413 body terlalu besar), default 400. */
+app.use((error, request, response, next) => {
+  if (response.headersSent) return next(error);
+  const status = error.status || error.statusCode || 400;
+  if (request.path.startsWith("/api/")) {
+    return response.status(status).json({ error: status === 400 ? "Permintaan tidak valid (Bad Request)" : status === 413 ? "Body permintaan terlalu besar" : "Terjadi kesalahan internal server" });
+  }
+  response.status(status).send("Permintaan tidak valid");
+});
+if (require.main === module) {
+  // Railway and other container hosts route traffic through the container
+  // network, so binding only to loopback makes the service unreachable.
+  // "::" = dual-stack: melayani localhost (::1 / IPv6) DAN 127.0.0.1 (IPv4)
+  // sekaligus, sehingga browser Windows yang me-resolve localhost ke IPv6
+  // tidak lagi gagal membuka halaman.
+  const HOST = process.env.HOST || "::";
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`SoraNema personal: http://localhost:${PORT}`);
+    if (MAINTENANCE) console.log("MAINTENANCE MODE AKTIF: route non-API menyajikan halaman maintenance. API tetap hidup.");
+    /* HOST default "::" membuat server terjangkau dari internet. Kalau nanti
+       dibungkus Railway/Render/Nginx tanpa TRUST_PROXY=1, semua pengunjung
+       terhitung sebagai satu IP sehingga rate limit jadi kuota bersama:
+       dari 20 pengguna berbeda hanya ~12 yang bisa mencari bersamaan. */
+    if (!TRUST_PROXY && HOST !== "127.0.0.1" && HOST !== "localhost") {
+      console.log("PERINGATAN: TRUST_PROXY belum aktif. Kalau server ini di belakang reverse proxy, set TRUST_PROXY=1 supaya rate limit membedakan IP asli tiap pengguna.");
+    }
+    /* Tanpa rahasia tetap, token ditandatangani dengan kunci acak per proses.
+       Link yang dibagikan akan mati setelah restart atau pindah instance. */
+    if (!process.env.DOWNLOAD_TOKEN_SECRET) {
+      console.log("PERINGATAN: DOWNLOAD_TOKEN_SECRET belum diset. Tautan /unduh/ akan kedaluwarsa setiap server restart atau antar-instance.");
+    }
+  });
+
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.error(
+        `Port ${PORT} sedang dipakai proses lain. Hentikan proses lama atau jalankan dengan PORT=3100 npm start.`
+      );
+    } else {
+      console.error(`Server gagal dijalankan: ${error.message}`);
+    }
+
+    process.exitCode = 1;
+  });
+
+  /* Ctrl+C dan SIGTERM (dipakai npm run dev saat file berubah) lewat jalur
+     yang sama: listener ditutup segera, tapi pencarian/unduhan yang sedang
+     berjalan diselesaikan dulu. Tanpa ini proses mati di tengah respons dan
+     UI melaporkan "Tautan Samehadaku gagal dimuat" padahal hanya restart. */
+  const pemutus = createGracefulShutdown(server, {
+    log: (pesan) => console.log(pesan),
+    /* Supervisor dev menunggu kabar ini sebelum menjalankan proses pengganti
+       di port yang sama. */
+    setelahListenerDitutup: () => {
+      if (typeof process.send === "function") process.send({ type: "listener-ditutup" });
+    },
+  });
+  process.on("SIGTERM", () => pemutus.matikan("SIGTERM"));
+  process.on("SIGINT", () => pemutus.matikan("SIGINT"));
+  /* Windows tidak punya SIGTERM sungguhan: child.kill() di sana memanggil
+     TerminateProcess tanpa menjalankan handler JS. Karena itu restart dari
+     npm run dev memakai pesan IPC, bukan sinyal. */
+  process.on("message", (pesan) => {
+    if (pesan && pesan.type === "berhenti-anggun") pemutus.matikan("permintaan dev");
+  });
+}
+
+module.exports = { app, catatLaporanTautan, laporanTautanPublik, normalisasiLaporanTautan, kunciLaporanTautan, simpanLaporanTautanSekarang, kosongkanLaporanTautan, LAPORAN_AMBANG, LAPORAN_TTL_MS, LAPORAN_BERKAS, isSourceUnavailable, slices, uniqueBySlug, normalizeEpisodes, todayKey, todayLabel, decodeMirror, normalizeSearchText, splitAliases, titleAliasRecord, matchesTitle, cached, isStale, readFallbackDaily, fallbackDetailFromDaily, runtimeStats, extractSlug, isBlockedSourceHtml, SOURCE_ACCEPT_STATUS, isUsableSourceBody, stateFor, primarySourceState, snapshotSourceStates, parseAnimeCards, parseAnimeCardsWithDiagnostics, parseGenreLinks, parseDailyCards, parseAlphabetCardsWithDiagnostics, parseAnimeDetail, parseDownloadBatches, ambilRentangEpisode, targetUnduhanLangsung, targetUnduhanHalaman, buatTokenUnduhan, bacaTokenUnduhan, tautanUnduhan, namaHostUnduhan, detailUnduhan, parseMirrorOptions, normalisasiMirror, hasNextPage, fetchCatalogPage, fetchAlphabetPage, fetchAnimeDetail, createTokenBucket, normalizeTitleKey, parseSamehadakuSearch, parseSamehadakuAnime, mergeSupplementEpisodes, getSourceConfig, SOURCE_CONFIGS, MIRROR_ONLY_SOURCES, fetchSamehadakuEpisodes, detailErrorStatus, statusOngoing, titleForAniList, titleMatchScore, sortRecommendations, enrichRecommendations, parseSamehadakuDownloads, fetchSamehadakuDownloads, kandidatSlugSamehadaku, kunciJudulSamehadaku, batchSamehadakuTersimpan, pilihBatchUnduhan, parseSamehadakuMirrors, samehadakuMirrorUntukEpisode, nomorEpisodeDariSlug, metaEpisodeDariSlug, hianimeMirrorUntukEpisode, hianimeMirrorUntukEpisodeHtml, hianimeMirrorDariHalaman, resolveHianimeAnime, hianimeModeApi, hianimeApiUrl, cariHianimeApi, resolveHianimeAnimeApi, episodeHianimeApiUntuk, detailDariAnimeHianime, fetchHianimeDetail, fetchDetailDenganCadangan, kartuDariHasilHianime, cariKatalogHianime, gabungKartuKatalog, metaEpisodeHianimeTersimpan, ingatMetaEpisodeHianime, petakanHasilHianimeApi, petakanEpisodeHianimeApi, streamsDariEpisodeHianime, fetchHianimeEpisodes, fetchHianimeEpisodesHtml, parseAnimasuEpisodeMeta, parseHianimeSearch, judulHianimeCocok, pilihKandidatHianime, parseHianimeEpisodeLinks, decodeHianimeServers, iframeHianimePertama, bukaHianimeEmbed, bukaSemuaHianimeEmbed, mergeMirrorStreams, labelMirror, labelMergedMirrors, singkatResolusi };

@@ -1,0 +1,212 @@
+import { registerSeal, verify } from "./integrity.js";
+registerSeal("api", "copyright SoraNema");
+const cache = new Map();
+let activeCatalogController = null;
+
+/* Cache sisi klien tidak pernah expire di versi lama: query yang sama
+   dipanggil lagi beberapa menit kemudian dijawab dari memori, padahal
+   server sudah punya data baru. TTL pendek + batas jumlah entri menjaga
+   hasil tetap akurat tanpa request ulang yang sia-sia. */
+const CACHE_TTL_MS = 60_000;
+const CACHE_MAX_ENTRIES = 40;
+function cacheGet(key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) { cache.delete(key); return null; }
+  return entry.promise;
+}
+function cacheSet(key, promise) {
+  cache.delete(key);
+  cache.set(key, { promise, timestamp: Date.now() });
+  while (cache.size > CACHE_MAX_ENTRIES) cache.delete(cache.keys().next().value);
+}
+
+/* Setiap request punya batas waktu. Tanpa ini, satu request yang macet
+   menggantung antarmuka SELAMANYA - bukan "lambat", tapi tidak pernah selesai,
+   dan tidak ada pesan apa pun yang sampai ke pengguna. 20 detik: cukup untuk
+   katalog dingin yang memang butuh ~10 detik, dan masih bisa gagal cepat
+   daripada menggantung. */
+const REQUEST_TIMEOUT_MS = 20_000;
+
+/* Batas waktu punya DUA jam, bukan satu.
+   - Jam RESPON: header harus sampai dalam REQUEST_TIMEOUT_MS.
+   - Jam BADAN: mulai DARI KETIKA header tiba, jadi badan yang tulis
+     lambat tidak ikut dihitung sebagai "tidak merespons".
+   Dengan satu jam untuk keduanya, balasan yang tiba 1 milidetik
+   sebelum batas bisa terbuang dan dilaporkan sebagai timeout -
+   dibuktikan fuzz: delay 299 ms dari batas 300 ms dilaporkan
+   "tidak merespons dalam 0 detik". Sekarang header diukur sendiri,
+   dan jam badan mulai setelah header tiba, jadi balasan yang memang
+   di bawah batas selalu berhasil.
+   Jam badan tetap ada supaya "header lalu body macet" tidak menggantung
+   selamanya - itu cacat yang dulu ditemukan di sini. */
+const BODY_TIMEOUT_GRACE_MS = Math.max(250, Math.floor(REQUEST_TIMEOUT_MS / 4));
+function denganBatasWaktu(options) {
+  const kendali = new AbortController();
+  let lewatWaktu = false;
+  let lewatWaktuBody = false;
+  let timerBody = null;
+  const timer = setTimeout(() => { lewatWaktu = true; kendali.abort(); }, REQUEST_TIMEOUT_MS);
+  const luar = options.signal;
+  if (luar) {
+    if (luar.aborted) kendali.abort();
+    else luar.addEventListener("abort", () => kendali.abort(), { once: true });
+  }
+  return {
+    signal: kendali.signal,
+    lewatWaktu: () => lewatWaktu,
+    lewatWaktuBody: () => lewatWaktuBody,
+    /* Dipanggil setelah header tiba: fase header SELESAI, jadi jam
+       respons dimatikan (kalau tidak, ia tetap membatalkan badan yang
+       sebenarnya sedang mengalir baik-baik), dan jam badan mulai dari
+       titik ini. */
+    mulaiBadan: () => {
+      if (timerBody) return;
+      clearTimeout(timer);
+      timerBody = setTimeout(() => { lewatWaktuBody = true; kendali.abort(); }, REQUEST_TIMEOUT_MS + BODY_TIMEOUT_GRACE_MS);
+    },
+    berhenti: () => { clearTimeout(timer); if (timerBody) clearTimeout(timerBody); },
+  };
+}
+
+async function request(path, options = {}) {
+  const batas = denganBatasWaktu(options);
+  try {
+    /* Digest seal ikut di setiap request API. Lapisan tepi PHP memakainya
+       sebagai tripwire: klien yang seal-nya dihapus tidak mengirim header
+       ini. Dihitung ulang, bukan di-cache, supaya modul yang mendaftar
+       belakangan tetap ikut terhitung. Guard typeof membuat modul ini tetap
+       bisa diuji tanpa integrity.js. */
+    let sealDigest = "";
+    try { sealDigest = typeof verify === "function" ? String(verify().digest || "") : ""; } catch { sealDigest = ""; }
+    const headers = { ...(sealDigest ? { "X-ILN-Seal": sealDigest } : {}), ...(options.headers || {}) };
+    const response = await fetch(path, { ...options, headers, signal: batas.signal });
+    /* Header sudah tiba. Jam badan mulai dari titik ini - badan yang
+       lambat tulis tidak boleh dihitung sebagai "tidak merespons". */
+    batas.mulaiBadan();
+    /* response.text() WAJIB di dalam jendela batas waktu. Versi pertama
+       menghentikan timer sebelum body dibaca, jadi server yang sudah
+       mengirim header lalu macet di body akan menggantung selamanya -
+       persis cacat yang seharusnya ditutup. Diuji dengan skenario
+       "header lalu body macet". */
+    const body = await response.text();
+    let json;
+    try { json = JSON.parse(body); } catch (_) { const error = new Error(`Server mengembalikan respons tidak valid (HTTP ${response.status})`); error.status = response.status; throw error; }
+    /* JSON primitive (null, angka, string) sah bagi JSON.parse tapi bukan
+       bentuk respons yang kita pakai. Tanpa penjaga ini `json.error`
+       meledak jadi TypeError tanpa pesan yang berguna. */
+    if (!json || typeof json !== "object") { const error = new Error(`Server mengembalikan respons tidak valid (HTTP ${response.status})`); error.status = response.status; throw error; }
+    if (!response.ok || json.error) {
+      const error = new Error(json.error || `HTTP ${response.status}`);
+      error.status = response.status;
+      /* Server sudah tahu persis kapan kuota terisi lagi. Pakai angka itu
+         supaya retry benar-benar berhasil, bukan menebak 350ms lalu kena 429
+         lagi dan exhausting retry. */
+      error.retryAfterMs = Number(json.retryAfterMs) > 0 ? Number(json.retryAfterMs) : Number(response.headers.get("Retry-After")) * 1000;
+      if (!(error.retryAfterMs > 0)) delete error.retryAfterMs;
+      throw error;
+    }
+    return json;
+  } catch (e) {
+    if (batas.lewatWaktu()) {
+      const error = new Error(`Server tidak merespons dalam ${Math.round(REQUEST_TIMEOUT_MS / 1000)} detik`);
+      /* status 0 = bukan HTTP, jadi tidak masuk daftar retryable: error
+         batas waktu harus berhenti, bukan mengulang dan menambah 20 detik. */
+      error.status = 0;
+      error.timeout = true;
+      throw error;
+    }
+    if (batas.lewatWaktuBody()) {
+      /* Header tiba, badan tidak selesai: server menjawab tapi macet di
+         tengah. Fakta ini beda dari "tidak merespons" - pesan yang
+         jujur lebih berguna daripada "tidak merespons dalam 0 detik". */
+      const error = new Error(`Respons server terpotong: badan belum selesai dalam ${Math.round((REQUEST_TIMEOUT_MS + BODY_TIMEOUT_GRACE_MS) / 1000)} detik`);
+      error.status = 0;
+      error.timeout = true;
+      error.truncated = true;
+      throw error;
+    }
+    throw e;
+  } finally {
+    batas.berhenti();
+  }
+}
+
+function retryableStatus(status) { return [408, 425, 429, 500, 502, 503, 504].includes(Number(status)); }
+async function requestWithRetry(path, options = {}, retries = 1, onRetry) {
+  for (let attempt = 0; ; attempt += 1) {
+    try { return await request(path, options); } catch (error) {
+      if (options.signal?.aborted || attempt >= retries || !retryableStatus(error.status)) throw error;
+      const waitMs = Number(error.retryAfterMs) || 350 * (attempt + 1);
+      /* 429 dengan Retry-After panjang = antrean penuh, bukan glitch. Menunggu
+         10 detik di dalam UI lebih buruk daripada memberi tahu user. */
+      if (Number(error.status) === 429 && waitMs > 5_000) throw error;
+      const delay = waitMs;
+      onRetry?.(attempt + 1, delay, error);
+      if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("iln:catalog-retry", { detail: { attempt: attempt + 1, delay, status: error.status || 0 } }));
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, delay);
+        options.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new DOMException("Aborted", "AbortError")); }, { once: true });
+      });
+    }
+  }
+}
+
+function cachedRequest(key, path, options = {}) {
+  const hit = cacheGet(key);
+  if (hit) return hit;
+  const pending = request(path, options).catch((error) => {
+    if (cache.get(key)?.promise === pending) cache.delete(key);
+    throw error;
+  });
+  cacheSet(key, pending);
+  return pending;
+}
+
+export const api = {
+  /* no-store: /api/health dipakai untuk mendeteksi server yang baru di-restart.
+     Kalau browser boleh memakai salinan cache, bootId lama terus terbaca dan
+     pemberitahuan "server diperbarui" tidak pernah muncul. */
+  health: () => request("/api/health", { cache: "no-store" }),
+  daily: () => request("/api/daily"),
+  genres: () => request("/api/genres"),
+  /* Genre kosong = rekomendasi populer; genre diisi nama genre dari storage. */
+  recommendations: (genre = "") => cachedRequest(`rec|${genre}`, `/api/recommendations${genre ? `?genre=${encodeURIComponent(genre)}` : ""}`),
+  cancelCatalog() { activeCatalogController?.abort(); activeCatalogController = null; },
+  catalog(query, genre, onRetry) {
+    const normalizedQuery = String(query || "").trim();
+    const normalizedGenre = String(genre || "").trim();
+    const key = `${normalizedQuery.toLocaleLowerCase()}|${normalizedGenre.toLocaleLowerCase()}`;
+    const hit = cacheGet(key);
+    if (hit) return hit;
+    activeCatalogController?.abort();
+    const controller = new AbortController();
+    activeCatalogController = controller;
+    const params = new URLSearchParams({ search: normalizedQuery, genre: normalizedGenre });
+    const pending = requestWithRetry(`/api/catalog?${params}`, { signal: controller.signal }, 1, onRetry).catch((error) => {
+      /* Jangan simpan error ke cache: satu 429 tidak boleh membuat query
+         yang sama ikut gagal selama 60 detik ke depan. */
+      if (cache.get(key)?.promise === pending) cache.delete(key);
+      throw error;
+    }).finally(() => {
+      if (activeCatalogController === controller) activeCatalogController = null;
+    });
+    cacheSet(key, pending);
+    return pending;
+  },
+  detail: (slug) => request(`/api/anime/${encodeURIComponent(slug)}`),
+  /* Unduhan Samehadaku diambil terpisah supaya halaman detail tidak
+     menunggu sumber unduhan. Server menjawab dengan cadangan Animasu kalau
+     Samehadaku terlalu lama. */
+  downloads: (slug) => request(`/api/anime/${encodeURIComponent(slug)}/downloads`),
+  mirrors: (slug) => request(`/api/streams/${encodeURIComponent(slug)}`),
+  /* Laporan tautan/mirror mati dari pengguna lain. Server hanya menerima
+     hash tautan + token anonim, jadi tidak ada URL/IP yang berpindah. */
+  laporan: (episode = "") => request(`/api/laporan-tautan${episode ? `?episode=${encodeURIComponent(episode)}` : ""}`, { cache: "no-store" }),
+  laporkanTautan: (laporan) => request("/api/laporan-tautan", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(laporan),
+    cache: "no-store",
+  }),
+};
