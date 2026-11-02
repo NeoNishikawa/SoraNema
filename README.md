@@ -1,11 +1,15 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/NeoNishikawa/SoraNema/main/public/assets/logo.png" width="120" alt="Logo SoraNema">
   <h1>SoraNema</h1>
-  <p><strong>Pelacak anime untuk Windows.</strong><br>
+  <p><strong>Pelacak anime untuk Windows dan web.</strong><br>
   Katalog, episode, progres tonton, dan pustaka unduhan lokal dalam satu aplikasi.</p>
 
   <a href="https://github.com/NeoNishikawa/SoraNema/releases/tag/exe">
     <img src="https://img.shields.io/badge/Unduh-Windows%20x64-2ea44f?style=for-the-badge&logo=windows&logoColor=white" alt="Unduh SoraNema untuk Windows">
+  </a>
+  &nbsp;
+  <a href="https://soranema.up.railway.app">
+    <img src="https://img.shields.io/badge/Buka-Web%20SoraNema-1f6feb?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Buka SoraNema versi web">
   </a>
   <br><br>
   <img src="https://img.shields.io/badge/versi-0.2.0-1f6feb?style=flat-square" alt="Versi 0.2.0">
@@ -17,11 +21,11 @@
 
 ## Tentang
 
-SoraNema adalah aplikasi desktop Windows untuk menjelajah dan menonton anime dari katalog Animasu, lalu menyimpan sendiri progres serta daftar tontonanmu. Episode dan mirror tetap berasal dari sumber pihak ketiga; SoraNema tidak menghosting video dan tidak meminta akun.
+SoraNema adalah pelacak anime untuk Windows dan web. Aplikasi menjelajah katalog Animasu, memutar episode dari mirror sumber, lalu menyimpan sendiri progres serta daftar tontonanmu. Episode dan mirror tetap berasal dari sumber pihak ketiga; SoraNema tidak menghosting video dan tidak meminta akun.
 
 Aplikasi ini dibuat untuk dipakai sendiri: koleksi, progres, dan favorit tersimpan di perangkat, bukan di server SoraNema. Kalau kamu sudah mengunduh anime ke komputer, fitur **Download** memindai folder itu dan menampilkannya sebagai pustaka lokal dengan judul dari nama folder dan episode dari nama berkas.
 
-Build yang dibagikan di sini adalah **Windows x64**. Versi Android belum memiliki build publik, jadi README ini sengaja hanya memuat tautan Windows.
+Build desktop yang dibagikan di sini adalah **Windows x64**; versi web bisa langsung dibuka di peramban. Versi Android belum memiliki build publik, jadi README ini tidak memuat tautan APK.
 
 ## Fitur
 
@@ -43,6 +47,17 @@ Build yang dibagikan di sini adalah **Windows x64**. Versi Android belum memilik
 Tombol di atas menuju halaman rilis `exe`, tempat installer dan `latest.yml` disimpan. Halaman itu selalu menampilkan rilis Windows terbaru.
 
 Build Android belum dibagikan. Kalau nanti sudah selesai, tautannya akan ditambahkan di halaman rilis yang sama.
+
+## Web
+
+Versi web tidak perlu dipasang. Buka salah satu alamat berikut di peramban desktop:
+
+| Alamat | Catatan |
+|---|---|
+| https://soranema.up.railway.app | alamat web |
+| https://ilovenime.up.railway.app | alamat alternatif |
+
+Keduanya menjalankan SoraNema v3. Koleksi dan progres versi web tersimpan di localStorage peramban, terpisah dari data aplikasi Windows. Fitur Download hanya ada di aplikasi desktop karena membutuhkan akses folder.
 
 ## Cara pasang
 
@@ -93,7 +108,13 @@ Catatan rilis lengkap ada di halaman [rilis `exe`](https://github.com/NeoNishika
 
 ## Laporan
 
-Menemukan bug atau punya saran? Buka [Issues](https://github.com/NeoNishikawa/SoraNema/issues) dan sertakan versi aplikasi, langkah yang kamu lakukan, dan pesan error yang muncul.
+Punya kritik, saran, atau menemukan bug? Isi [formulir laporan](https://tally.so/r/7RAZd2). Sertakan versi aplikasi, langkah yang kamu lakukan, dan pesan error yang muncul.
+
+Untuk masalah teknis yang lebih cocok didiskusikan terbuka, [Issues](https://github.com/NeoNishikawa/SoraNema/issues) tetap tersedia.
+
+## Dukungan
+
+SoraNema gratis dan tidak meminta akun. Kalau aplikasi ini berguna, kamu bisa mendukung pengembangannya lewat [SociaBuzz TRIBE](https://sociabuzz.com/neonishikawa/tribe). Dukungan bersifat opsional; semua fitur tetap bisa dipakai tanpa itu.
 
 ## Catatan
 
