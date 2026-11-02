@@ -121,5 +121,5 @@ SoraNema gratis dan tidak meminta akun. Kalau aplikasi ini berguna, kamu bisa me
 SoraNema tidak berafiliasi dengan situs web atau layanan mirror mana pun. Aplikasi ini tidak menghosting video dan tidak menyediakan tautan unduhan anime. Seluruh konten berasal dari layanan pihak ketiga di luar kendali pengembang. Gunakan sesuai hukum yang berlaku di tempatmu.
 
 <div align="center">
-  <sub>Dibuat dan dirawat oleh NeoNishikawa.</sub>
+  <sub>Dibuat dan dirawat oleh NeoNishikawa dan Ciel.</sub>
 </div>
