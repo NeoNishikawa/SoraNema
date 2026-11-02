@@ -21,7 +21,7 @@
 
 ## Tentang
 
-SoraNema adalah pelacak anime untuk Windows dan web. Aplikasi menjelajah katalog Animasu, memutar episode dari mirror sumber, lalu menyimpan sendiri progres serta daftar tontonanmu. Episode dan mirror tetap berasal dari sumber pihak ketiga; SoraNema tidak menghosting video dan tidak meminta akun.
+SoraNema adalah pelacak anime untuk Windows dan web. Aplikasi menjelajah katalog, memutar episode dari mirror yang tersedia, lalu menyimpan sendiri progres serta daftar tontonanmu. Semua katalog dan mirror berasal dari layanan pihak ketiga; SoraNema tidak menghosting video dan tidak meminta akun.
 
 Aplikasi ini dibuat untuk dipakai sendiri: koleksi, progres, dan favorit tersimpan di perangkat, bukan di server SoraNema. Kalau kamu sudah mengunduh anime ke komputer, fitur **Download** memindai folder itu dan menampilkannya sebagai pustaka lokal dengan judul dari nama folder dan episode dari nama berkas.
 
@@ -31,7 +31,7 @@ Build desktop yang dibagikan di sini adalah **Windows x64**; versi web bisa lang
 
 | Fitur | Yang didapat |
 |---|---|
-| Katalog dan pencarian | Judul, jadwal harian, genre, dan daftar episode dari Animasu. Episode yang belum tersedia bisa dilengkapi dari Samehadaku. |
+| Katalog dan pencarian | Judul, jadwal harian, genre, dan daftar episode dari katalog sumber. Episode yang belum tersedia bisa dilengkapi dari sumber lain. |
 | Rekomendasi | Rail **Terpopuler** dan rekomendasi genre dari anime yang sudah kamu tamatkan. |
 | Pemutar | Mirror pilihan sumber, Picture-in-Picture, episode sebelumnya/berikutnya, dan lanjut otomatis. |
 | Pustaka Download | Pindai folder lokal, filter persentase, sudah ditonton, favorit, rentang persentase, dan pencarian nama. Tanpa filter genre. |
@@ -118,7 +118,7 @@ SoraNema gratis dan tidak meminta akun. Kalau aplikasi ini berguna, kamu bisa me
 
 ## Catatan
 
-SoraNema tidak berafiliasi dengan Animasu, Samehadaku, atau layanan mirror mana pun. Aplikasi ini tidak menghosting video dan tidak menyediakan tautan unduhan anime. Gunakan sesuai hukum yang berlaku di tempatmu.
+SoraNema tidak berafiliasi dengan situs web atau layanan mirror mana pun. Aplikasi ini tidak menghosting video dan tidak menyediakan tautan unduhan anime. Seluruh konten berasal dari layanan pihak ketiga di luar kendali pengembang. Gunakan sesuai hukum yang berlaku di tempatmu.
 
 <div align="center">
   <sub>Dibuat dan dirawat oleh NeoNishikawa.</sub>
