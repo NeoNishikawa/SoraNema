@@ -67,14 +67,14 @@ Keduanya menjalankan SoraNema v3. Koleksi dan progres versi web tersimpan di loc
 4. Setelah terpasang, buka SoraNema. Kalau WebView2 belum ada, installer akan mengunduh komponennya.
 5. Untuk fitur Download, pilih folder induk yang berisi semua anime, masing-masing di subfolder sendiri.
 
-**Penting untuk versi lama:** pengguna 0.1.0 dan Electron 1.7.x harus memasang 0.2.0 **sekali secara manual**. Updater 0.1.0 menunjuk alamat repo yang salah, dan nomor 0.1.0 lebih rendah dari 1.7.x. Setelah 0.2.0 terpasang, pembaruan berikutnya berjalan di dalam aplikasi.
+**Penting untuk versi lama:** pengguna 0.1.0 dan Electron 1.7.x harus memasang 0.4.3 **sekali secara manual**. Updater 0.1.0 menunjuk alamat repo yang salah, dan nomor 0.1.0 lebih rendah dari 1.7.x. Setelah 0.4.3 terpasang, pembaruan berikutnya berjalan di dalam aplikasi.
 
 ## Persyaratan
 
 | | |
 |---|---|
 | Sistem | Windows 10 atau 11, 64-bit |
-| Ruang | sekitar 53 MB untuk aplikasi, belum termasuk berkas video |
+| Ruang | sekitar 45 MB untuk aplikasi, belum termasuk berkas video |
 | Koneksi | diperlukan untuk katalog, episode, dan mirror |
 | WebView2 | dipasang otomatis oleh installer bila belum ada |
 | Akun | tidak diperlukan |
@@ -87,7 +87,11 @@ Keduanya menjalankan SoraNema v3. Koleksi dan progres versi web tersimpan di loc
 - Permintaan katalog dan mirror dikirim langsung ke sumber pihak ketiga, bukan lewat akun atau server pribadi.
 - Menghapus data aplikasi akan menghapus koleksi dan progres. Video di folder unduhan tidak disentuh.
 
-## Yang baru di 0.2.0
+## Yang baru di 0.4.3
+
+- Pemeriksaan update setiap 30 menit + tombol Periksa Update di sidebar.
+- Hero Update Hari Ini, section Kemarin, Popular dua mode, dan shelf Tinggal Sedikit Lagi.
+- Kartu Rekomendasi Genre dan Kemarin disamakan ukurannya dengan Local Storage (166px).
 
 - Rekomendasi **Terpopuler** dan genre dari anime yang sudah ditamatkan.
 - Pustaka **Download** untuk memindai folder anime lokal, lengkap dengan PiP dan lanjut otomatis.
