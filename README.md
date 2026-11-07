@@ -12,7 +12,7 @@
     <img src="https://img.shields.io/badge/Buka-Web%20SoraNema-1f6feb?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Buka SoraNema versi web">
   </a>
   <br><br>
-  <img src="https://img.shields.io/badge/versi-0.4.3-1f6feb?style=flat-square" alt="Versi 0.4.3">
+  <img src="https://img.shields.io/badge/versi-0.4.4-1f6feb?style=flat-square" alt="Versi 0.4.4">
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078d4?style=flat-square&logo=windows" alt="Windows 10 dan 11">
   <img src="https://img.shields.io/badge/status-aktif-2ea44f?style=flat-square" alt="Status aktif">
 </div>
@@ -42,7 +42,7 @@ Build desktop yang dibagikan di sini adalah **Windows x64**; versi web bisa lang
 
 | Platform | Berkas | Ukuran |
 |---|---|---|
-| Windows 10 / 11 (x64) | `SoraNema_X0.V4.N3_x64-setup.exe` | 45 MB |
+| Windows 10 / 11 (x64) | `SoraNema_X0.V4.N4_x64-setup.exe` | 45 MB |
 
 Tombol di atas menuju halaman rilis `exe`, tempat installer dan `latest.yml` disimpan. Halaman itu selalu menampilkan rilis Windows terbaru.
 
@@ -67,7 +67,7 @@ Keduanya menjalankan SoraNema v3. Koleksi dan progres versi web tersimpan di loc
 4. Setelah terpasang, buka SoraNema. Kalau WebView2 belum ada, installer akan mengunduh komponennya.
 5. Untuk fitur Download, pilih folder induk yang berisi semua anime, masing-masing di subfolder sendiri.
 
-**Penting untuk versi lama:** pengguna 0.1.0 dan Electron 1.7.x harus memasang 0.4.3 **sekali secara manual**. Updater 0.1.0 menunjuk alamat repo yang salah, dan nomor 0.1.0 lebih rendah dari 1.7.x. Setelah 0.4.3 terpasang, pembaruan berikutnya berjalan di dalam aplikasi.
+**Penting untuk versi lama:** pengguna 0.1.0 dan Electron 1.7.x harus memasang 0.4.4 **sekali secara manual**. Updater 0.1.0 menunjuk alamat repo yang salah, dan nomor 0.1.0 lebih rendah dari 1.7.x. Setelah 0.4.4 terpasang, pembaruan berikutnya berjalan di dalam aplikasi.
 
 ## Persyaratan
 
@@ -87,10 +87,11 @@ Keduanya menjalankan SoraNema v3. Koleksi dan progres versi web tersimpan di loc
 - Permintaan katalog dan mirror dikirim langsung ke sumber pihak ketiga, bukan lewat akun atau server pribadi.
 - Menghapus data aplikasi akan menghapus koleksi dan progres. Video di folder unduhan tidak disentuh.
 
-## Yang baru di 0.4.3
+## Yang baru di 0.4.4
 
+- Baris "Tinggal Sedikit Lagi" dihapus dari beranda dan pindah ke Local Storage sebagai tab **50%** (progres ≥50%, belum tamat).
 - Pemeriksaan update setiap 30 menit + tombol Periksa Update di sidebar.
-- Hero Update Hari Ini, section Kemarin, Popular dua mode, dan shelf Tinggal Sedikit Lagi.
+- Hero Update Hari Ini, section Kemarin, dan Popular dua mode.
 - Kartu Rekomendasi Genre dan Kemarin disamakan ukurannya dengan Local Storage (166px).
 
 - Rekomendasi **Terpopuler** dan genre dari anime yang sudah ditamatkan.
