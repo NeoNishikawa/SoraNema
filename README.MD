@@ -22,7 +22,6 @@ yang tersimpan di browser sendiri — tanpa akun, tanpa server antara, tanpa rib
 
 ## ✨ Fitur
 
-- **Katalog ganda** — Animasu + HiAnime, judul Animasu menang, HiAnime menambah yang tidak ada (mis. Cyberpunk: Edgerunners 2).
 - **Detail + episode** — daftar episode, player mirror, label episode, kontrol Lengkap.
 - **Unduhan link-out** — resolusi → sumber (Masu/Mega) → tautan; host difilter server (Google Drive, Mega, MediaFire, Pixeldrain).
 - **Local Storage** — koleksi, progres, favorit, import/export, edit mode, sediakan data tanpa server.
