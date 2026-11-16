@@ -313,7 +313,7 @@ function setupSwipeCards() {
    lalu CSS memakai properti `translate` supaya transform hover dan gestur
    seret kartu tidak ditimpa. Reduced motion dan tier rendah tidak memantul. */
 function setupRailBoing() {
-  const rails = ["#continueRail", "#recPopularRail", "#recGenreRail"]
+  const rails = ["#continueRail", "#recGenreRail"]
     .map((selector) => $(selector))
     .filter(Boolean);
   if (!rails.length) return;
@@ -621,11 +621,12 @@ function renderUpdates() {
    genre hanya tampil kalau pengguna sudah menamatkan minimal dua anime dengan
    genre yang sama. Data rating/view datang dari /api/recommendations. */
 const REC_UI = {
-  popular: { section: "#recPopularSection", rail: "#recPopularRail", wrap: "#recPopularSection .rec-rail-wrap", sub: "#recPopularSub", label: "Rekomendasi Populer" },
+  popular: { section: "#recPopularSection", grid: "#recPopularGrid", sub: "#recPopularSub", label: "Rekomendasi Populer" },
   genre: { section: "#recGenreSection", rail: "#recGenreRail", wrap: "#recGenreSection .rec-rail-wrap", sub: "#recGenreSub", label: "Rekomendasi Genre" },
 };
-function recNodes(kind) { const cfg = REC_UI[kind]; return { cfg, section: $(cfg.section), rail: $(cfg.rail), wrap: $(cfg.wrap), sub: $(cfg.sub) }; }
+function recNodes(kind) { const cfg = REC_UI[kind]; return { cfg, section: $(cfg.section), rail: $(cfg.rail), grid: $(cfg.grid), wrap: $(cfg.wrap), sub: $(cfg.sub) }; }
 function recSkeletonHTML(count = 6) { return Array.from({ length: count }, () => '<div class="rec-card-skeleton" aria-hidden="true"><span class="rec-skel-art"></span><span class="rec-skel-line"></span><span class="rec-skel-line short"></span></div>').join(""); }
+function recGridSkeletonHTML(count = 6) { return Array.from({ length: count }, () => '<div class="skel" aria-hidden="true"><div class="sk-thumb"></div><div class="sk-line"></div><div class="sk-line short"></div></div>').join(""); }
 function recCardsHTML(items = []) { return items.map((anime, index) => cardHTML(anime, { rank: index + 1, homeSection: true, showViews: true, hideEps: true })).join(""); }
 function updateRecNav(kind) {
   const { rail, wrap } = recNodes(kind);
@@ -648,25 +649,24 @@ function scrollRec(kind, direction) {
   rail.scrollBy({ left: direction * step * visible, behavior: reduced ? "auto" : "smooth" });
 }
 function setupRecRails() {
-  for (const kind of ["popular", "genre"]) {
+  for (const kind of ["genre"]) {
     const { rail, wrap } = recNodes(kind);
     wrap?.querySelector("[data-rec-prev]")?.addEventListener("click", () => scrollRec(kind, -1));
     wrap?.querySelector("[data-rec-next]")?.addEventListener("click", () => scrollRec(kind, 1));
     rail?.addEventListener("scroll", () => updateRecNav(kind), { passive: true });
     updateRecNav(kind);
   }
-  window.addEventListener("resize", () => { updateRecNav("popular"); updateRecNav("genre"); }, { passive: true });
+  window.addEventListener("resize", () => { updateRecNav("genre"); }, { passive: true });
 }
 function renderPopularRecommendations() {
-  const { section, rail, sub } = recNodes("popular");
-  if (!section || !rail) return;
+  const { section, grid, sub } = recNodes("popular");
+  if (!section || !grid) return;
   const show = state.recPopularLoading || state.recPopular.length > 0;
   section.hidden = !show;
   if (!show) return;
   if (sub) sub.textContent = state.recPopularLoading ? "Mencari anime paling populer…" : `${state.recPopular.length} anime · urut view lalu rating`;
-  rail.innerHTML = state.recPopularLoading ? recSkeletonHTML() : recCardsHTML(state.recPopular);
-  if (!state.recPopularLoading) staggerIn(rail);
-  requestAnimationFrame(() => updateRecNav("popular"));
+  grid.innerHTML = state.recPopularLoading ? recGridSkeletonHTML() : recCardsHTML(state.recPopular);
+  if (!state.recPopularLoading) staggerIn(grid);
 }
 function renderGenreRecommendations() {
   const top = topCompletedGenre(state.storageItems, 2);

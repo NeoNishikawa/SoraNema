@@ -64,7 +64,7 @@
 <!-- modulepreload HARUS setelah importmap. Kalau tidak, browser mulai
      memuat modul sebelum import map terbaca, lalu gagal me-resolve
      "animejs" dan seluruh aplikasi berhenti. -->
-<link rel="modulepreload" href="/js/reference-app.js?v=2.41.1" />
+<link rel="modulepreload" href="/js/reference-app.js?v=2.44.0" />
 <link rel="modulepreload" href="/js/api.js?v=1.3.3" />
 <link rel="modulepreload" href="/js/app-utils.js" />
 <script>
@@ -335,15 +335,7 @@ window.__ILN_SEAL__ = true;
             <div class="sec-title"><span class="bar"></span>Rekomendasi Populer</div>
             <div class="sec-sub" id="recPopularSub">Mencari anime paling populer…</div>
           </div>
-          <div class="rec-rail-wrap">
-            <button class="rec-nav rec-nav-prev" type="button" data-rec-prev="popular" aria-label="Geser rekomendasi populer ke kiri" aria-controls="recPopularRail" title="Sebelumnya">
-              <svg class="ico"><use href="#i-chev-left"/></svg>
-            </button>
-            <div class="rec-rail" id="recPopularRail" tabindex="0" aria-label="Rekomendasi anime terpopuler"></div>
-            <button class="rec-nav rec-nav-next" type="button" data-rec-next="popular" aria-label="Geser rekomendasi populer ke kanan" aria-controls="recPopularRail" title="Berikutnya">
-              <svg class="ico"><use href="#i-chev-right"/></svg>
-            </button>
-          </div>
+          <div class="card-grid" id="recPopularGrid"></div>
         </section>
 
         <section id="searchSection" hidden>
@@ -611,7 +603,7 @@ window.__ILN_SEAL__ = true;
 <div id="dlPopupRoot"></div>
 <div class="toast-stack" id="toastStack"></div>
 
-<script type="module" src="/js/reference-app.js?v=2.41.1"></script>
+<script type="module" src="/js/reference-app.js?v=2.44.0"></script>
 </body>
 </html>
 
