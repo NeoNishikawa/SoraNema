@@ -4,80 +4,63 @@
 
 # SoraNema
 
-### *Your Anime Dekstop*
+### Your Anime Desktop
 
-Pelacak anime pribadi: katalog, detail, episode, mirror unduhan, dan progres menonton
-yang tersimpan di browser sendiri — tanpa akun, tanpa server antara, tanpa ribet.
+Pelacak anime pribadi: katalog, detail, episode, dan progres menonton
+yang tersimpan di perangkat sendiri — tanpa akun, tanpa server perantara, tanpa ribet.
 
-[![versi](https://img.shields.io/badge/versi-3.0.0-ef6c00?style=flat-square)](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe)
-[![unduh-exe](https://img.shields.io/badge/%E4%B8%8B%E4%BD%8D%E5%AF%B9%E4%B8%BA%8B-Windows%20%28EXE%29-007acc?style=for-the-badge)](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe)
-[![web](https://img.shields.io/badge/%E4%B8%8B%E4%BD%8D%E5%AF%B9%E4%B8%BA%8B-Web%20%28Railway%29-0db97e?style=for-the-badge)](https://soranema.up.railway.app)
-[![node](https://img.shields.io/badge/Node-%3E%3D24.22.1-43853d?style=flat-square)](https://nodejs.org)
-[![test](https://img.shields.io/badge/test-492%20lulus-2ea44f?style=flat-square)](#pemeriksaan)
-[![seal](https://img.shields.io/badge/seal-iln:3520811581-8a2be2?style=flat-square)](#pemeriksaan)
+[![Windows EXE](https://img.shields.io/badge/Windows%20EXE-007acc?style=for-the-badge&logo=windows)](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe)
+[![Android APK](https://img.shields.io/badge/Android%20APK-3ddc84?style=for-the-badge&logo=android)](https://github.com/NeoNishikawa/SoraNema/releases/tag/apk)
+[![Web Railway](https://img.shields.io/badge/Web%20Railway-0db97e?style=for-the-badge)](https://soranema.up.railway.app)
 
 </div>
 
 ---
 
-## ✨ Fitur
+## Tentang
 
-- **Detail + episode** — daftar episode, player mirror, label episode, kontrol Lengkap.
-- **Unduhan link-out** — resolusi → sumber (Masu/Mega) → tautan; host difilter server (Google Drive, Mega, MediaFire, Pixeldrain).
-- **Local Storage** — koleksi, progres, favorit, import/export, edit mode, sediakan data tanpa server.
-- **Lanjutkan Menonton + Rekomendasi Genre** — rail horizontal, satu baris kartu yang bisa digeser.
-- **Screen time** — penghitung waktu menonton, ambang, aman multi-tab.
-- **Spring-clean** — pemeliharaan katalog & pencarian otomatis, data pribadi tidak hilang.
+SoraNema adalah aplikasi pelacak anime pribadi: katalog, detail, episode, dan progres menonton, dengan seluruh data tersimpan di perangkat sendiri. Tidak ada akun, tidak ada server perantara antara perangkat dan sumber katalog; data pribadi tidak pernah meninggalkan perangkat.
 
-## 📥 Unduh
+## Fitur (Windows, Android, Web)
 
-| Platform | Berkas | Ukuran | Tautan |
-|---|---|---|---|
-| 🌐 Web | — (langsung jalan) | — | [soranema.up.railway.app](https://soranema.up.railway.app) |
-| 🪟 Windows (.exe) | `SoraNema_X0.V4.N6_x64-setup.exe` | ~45 MB | [GitHub Releases — tag `exe`](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe) |
-| 🤖 Android (.apk) | `SoraNema-release.apk` | ~2,4 MB | GitHub Releases — tag `apk` |
+- **Katalog & detail** — daftar anime, sinopsis, status, tipe, rating, studio, daftar episode.
+- **Lanjutkan Menonton** — progres tersimpan per anime; ketuk kartu untuk langsung lanjut ke episode berikutnya.
+- **Koleksi** — simpan anime favoritmu; hapus banyak sekaligus; ekspor dan impor koleksi sebagai file JSON.
+- **Pencarian & genre** — ketik judul, atau tambahkan `/genre:romansa,isekai` untuk menyaring berdasarkan ratusan genre.
+- **Episode berjendela** — daftar episode panjang dimuat bertahap agar aplikasi tetap ringan.
+- **Layar utama** — koleksi, lanjutkan menonton, dan panduan muncul semuanya; progres tersimpan lokal.
 
-> Installer EXE **X0.V4.N6** (0.4.6) — pembaruan otomatis dari aplikasi: cek → unduh → pasang → aplikasi dibuka kembali sendiri. Kalau SmartScreen menampilkan **Unknown Publisher**, klik **More info** lalu **Run anyway** — itu normal untuk build independen, dan hanya untuk berkas dari halaman rilis resmi SoraNema.
+### Android (.apk)
 
-## 🚀 Menjalankan
+- **Streaming native** — player video bawaan; sumber video yang tidak bisa diputar langsung dibuka lewat browser.
+- **Populer Hari Ini & Update Harian** — di halaman depan, data termuat otomatis.
+- **Intro sistem** — setiap kali aplikasi dibuka, sistem intro diputarkan; data dimuat di latar selama intro berjalan, jadi Beranda langsung terisi.
+- **Gratis sepenuhnya** — tanpa iklan, tanpa pembelian, tanpa biaya tersembunyi.
 
-```bash
-npm install
-npm start
-```
+## Keamanan & cara memasang
 
-Server lokal memakai port `3099` secara bawaan. Buka `http://127.0.0.1:3099/`.
+Aplikasi belum terdaftar di App Store atau Google Play, jadi insting pertama perangkat kamu mungkin menolak. Itu normal — bukan tanda berbahaya.
 
-## ✅ Pemeriksaan
+### Android
 
-```bash
-npm test            # 492 lulus, 1 gagal pre-existing (TRUST_PROXY lama)
-npm run seal:check  # segel integritas iln:3520811581
-npm run test:keys   # audit kunci pencarian
-```
+1. Unduh `SoraNema-I0.V1-release.apk` dari [halaman rilis](https://github.com/NeoNishikawa/SoraNema/releases/tag/apk).
+2. Buka berkas yang sudah diunduh.
+3. Bila muncul jendela "Pemblokiran menginstal aplikasi dari sumber tidak dikenal", ketuk **Pengaturan** lalu aktifkan **Izinkan dari sumber ini**.
+4. Kembali; ketuk **Install**.
 
-`npm run test:browser:all` menjalankan rangkaian uji browser yang tersedia.
-Halaman bantuan dan halaman pemeliharaan sengaja tidak memuat JavaScript.
+Kamu hanya perlu menyalakan izin ini sekali khusus untuk SoraNema. Setelah pasang selesai, kamu boleh mematikan izinnya lagi di `Pengaturan → Aplikasi → SoraNema`.
 
-## 🧱 Struktur singkat
+### Windows
 
-| Path | Isi |
-|---|---|
-| `server.js` | Server Express, API `/api/*`, dan halaman perantara unduhan |
-| `public/` | UI, aset, halaman bantuan, dan halaman pemeliharaan |
-| `edge/` | Lapisan PHP opsional untuk proxy dan halaman tepi |
-| `scripts/` | Seal, audit, dan skrip uji |
-| `test/` | Test Node untuk kontrak server dan UI |
+1. Unduh `SoraNema_X0.V4.N6_x64-setup.exe` dari [halaman rilis](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe).
+2. Buka berkas yang diunduh.
+3. Bila muncul jendela **Windows SmartScreen**, ketuk **More info**, lalu **Run anyway**.
+4. Ikuti petunjuk installer seperti biasa.
 
-## 📜 Catatan rilis
+### Verifikasi
 
-Semua catatan rilis, termasuk rilis desktop terbaru, ada di halaman
-[GitHub Releases](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe).
+Di halaman [rilis](https://github.com/NeoNishikawa/SoraNema/releases/tag/apk), SHA-256 berkas `SoraNema-I0.V1-release.apk` tercantum; kamu boleh membandingkannya dengan berkas yang kamu unduh untuk memastikan cocok.
 
----
+### Kenapa "sumber tidak dikenal"?
 
-<div align="center">
-
-*Dibuat dengan ♥ oleh Neo dan Ciel — SoraNema, rumah anime di Gratis untukmu.*
-
-</div>
+Karena perangkat memperlakukan semua aplikasi non–Play Store sebagai "tidak dikenal". Itu bukan peringatan virus; itu perangkat bertanya apakah kamu percaya aplikasi ini. Kamu yang memutuskan — kami tidak bisa menyalakan izinnya untuk kamu, dan kamu bisa kapan pun mematikannya lagi.
