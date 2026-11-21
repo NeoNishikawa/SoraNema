@@ -26,7 +26,8 @@ SoraNema adalah aplikasi pelacak anime pribadi: katalog, detail, episode, dan pr
 SoraHane adalah varian Windows yang lebih ringan dari SoraNema X0.V4.N6. Bagian antarmuka ditulis ulang tanpa framework, dengan server Express lokal minimal, supaya aplikasi terbuka cepat dan tidak membawa bagian yang tidak dipakai.
 
 - **Intro 5 detik** — logo, nama, dan "O tanoshimi kudasai". Intro menutupi waktu muat data: katalog sudah diminta di latar belakang, jadi halaman utama langsung terisi saat intro selesai.
-- **Auto-update** — sejak H1 aplikasi memeriksa `latest.json` saat dibuka dan memasang versi baru sendiri (selepas 1.0.1: otomatis).
+- **Auto-update** — sejak H1 aplikasi memeriksa `latest.json` saat dibuka dan memasang versi baru sendiri (selepas 1.0.3: otomatis).
+- **Update Hari Ini** — rail di atas katalog: anime dari Animasu yang mendekati rilis (`/jadwal/`), badge "Sudah Rilis!"/Baru, klik buka detail.
 - **Pencarian** — hanya hasil yang benar-benar cocok; sementara mencari, status "Mencari...".
 - **Lanjutkan Menonton** — rail di atas katalog yang berisi episode terakhir (dari `localStorage`, maks 24); klik melanjutkan episode itu.
 - **Pemutar** — Tutup/`Esc`, daftar mirror, penanda mirror mati (diputar yang hidup).
