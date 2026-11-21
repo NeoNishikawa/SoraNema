@@ -21,6 +21,17 @@ yang tersimpan di perangkat sendiri — tanpa akun, tanpa server perantara, tanp
 
 SoraNema adalah aplikasi pelacak anime pribadi: katalog, detail, episode, dan progres menonton, dengan seluruh data tersimpan di perangkat sendiri. Tidak ada akun, tidak ada server perantara antara perangkat dan sumber katalog; data pribadi tidak pernah meninggalkan perangkat.
 
+## SoraHane (Windows)
+
+SoraHane adalah varian Windows yang lebih ringan dari SoraNema X0.V4.N6. Bagian antarmuka ditulis ulang tanpa framework, dengan server Express lokal minimal, supaya aplikasi terbuka cepat dan tidak membawa bagian yang tidak dipakai.
+
+- **Intro 5 detik** — logo, nama, dan "O tanoshimi kudasai". Intro menutupi waktu muat data: katalog sudah diminta di latar belakang, jadi halaman utama langsung terisi saat intro selesai.
+- **Auto-update** — sejak H1 aplikasi memeriksa `latest.json` saat dibuka dan memasang versi baru sendiri.
+- **Data lokal** — progres menonton tersimpan di perangkat; tanpa akun dan tanpa server perantara.
+- **Installer 3.2 MiB.**
+
+Unduh: **[SoraHane H1](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe-Hane)**
+
 ## Fitur (Windows, Android, Web)
 
 - **Katalog & detail** — daftar anime, sinopsis, status, tipe, rating, studio, daftar episode.
