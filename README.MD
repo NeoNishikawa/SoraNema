@@ -9,7 +9,7 @@
 Pelacak anime pribadi: katalog, detail, episode, dan progres menonton
 yang tersimpan di perangkat sendiri — tanpa akun, tanpa server perantara, tanpa ribet.
 
-[![Windows EXE](https://img.shields.io/badge/Windows%20EXE-007acc?style=for-the-badge&logo=windows)](https://github.com/NeoNishikawa/SoraNema/releases/tag/Hane)
+[![Windows EXE](https://img.shields.io/badge/Windows%20EXE-007acc?style=for-the-badge&logo=windows)](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe-Hane)
 [![Android APK](https://img.shields.io/badge/Android%20APK-3ddc84?style=for-the-badge&logo=android)](https://github.com/NeoNishikawa/SoraNema/releases/tag/apk)
 [![Web Railway](https://img.shields.io/badge/Web%20Railway-0db97e?style=for-the-badge)](https://soranema.up.railway.app)
 
@@ -52,7 +52,7 @@ Kamu hanya perlu menyalakan izin ini sekali khusus untuk SoraNema. Setelah pasan
 
 ### Windows
 
-1. Unduh `SoraHane_1.0.0_x64-setup.exe` dari [halaman rilis](https://github.com/NeoNishikawa/SoraNema/releases/tag/Hane).
+1. Unduh `SoraHane_1.0.0_x64-setup.exe` dari [halaman rilis](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe-Hane).
 2. Buka berkas yang diunduh.
 3. Bila muncul jendela **Windows SmartScreen**, ketuk **More info**, lalu **Run anyway**.
 4. Ikuti petunjuk installer seperti biasa.
