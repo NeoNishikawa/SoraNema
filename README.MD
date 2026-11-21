@@ -28,7 +28,7 @@ SoraHane adalah varian Windows yang lebih ringan dari SoraNema X0.V4.N6. Bagian 
 - **Intro 5 detik** — logo, nama, dan "O tanoshimi kudasai". Intro menutupi waktu muat data: katalog sudah diminta di latar belakang, jadi halaman utama langsung terisi saat intro selesai.
 - **Auto-update** — sejak H1 aplikasi memeriksa `latest.json` saat dibuka dan memasang versi baru sendiri.
 - **Data lokal** — progres menonton tersimpan di perangkat; tanpa akun dan tanpa server perantara.
-- **Installer 3.2 MiB.**
+- **Installer 4.6 MiB.**
 
 Unduh: **[SoraHane H1](https://github.com/NeoNishikawa/SoraNema/releases/tag/exe-Hane)**
 
